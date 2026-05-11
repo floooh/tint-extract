@@ -37,11 +37,13 @@
 #ifndef SRC_TINT_LANG_SPIRV_BUILTIN_FN_H_
 #define SRC_TINT_LANG_SPIRV_BUILTIN_FN_H_
 
+// clang-format off
+
 #include <cstdint>
 #include <string>
 
-#include "src/tint/lang/core/ir/call.h"
 #include "src/tint/utils/rtti/traits.h"
+#include "src/tint/lang/core/ir/call.h"
 
 // \cond DO_NOT_DOCUMENT
 namespace tint::spirv {
@@ -74,14 +76,19 @@ enum class BuiltinFn : uint8_t {
     kImageQuerySamples,
     kImageRead,
     kImageSampleImplicitLod,
+    kImageSampleProjImplicitLod,
+    kImageSampleProjDrefImplicitLod,
     kImageSampleExplicitLod,
+    kImageSampleProjExplicitLod,
+    kImageSampleProjDrefExplicitLod,
     kImageSampleDrefImplicitLod,
     kImageSampleDrefExplicitLod,
     kImageWrite,
+    kOpImage,
+    kOpSampledImage,
     kMatrixTimesMatrix,
     kMatrixTimesScalar,
     kMatrixTimesVector,
-    kSampledImage,
     kSelect,
     kVectorTimesMatrix,
     kVectorTimesScalar,
@@ -124,6 +131,8 @@ enum class BuiltinFn : uint8_t {
     kConvertFToS,
     kConvertSToF,
     kConvertUToF,
+    kSConvert,
+    kUConvert,
     kBitwiseAnd,
     kBitwiseOr,
     kBitwiseXor,
@@ -141,6 +150,17 @@ enum class BuiltinFn : uint8_t {
     kCooperativeMatrixLoad,
     kCooperativeMatrixStore,
     kCooperativeMatrixMulAdd,
+    kGroupNonUniformBroadcast,
+    kGroupNonUniformBroadcastFirst,
+    kGroupNonUniformQuadBroadcast,
+    kGroupNonUniformQuadSwap,
+    kGroupNonUniformShuffle,
+    kGroupNonUniformShuffleXor,
+    kGroupNonUniformShuffleDown,
+    kGroupNonUniformShuffleUp,
+    kGroupNonUniformSMin,
+    kGroupNonUniformSMax,
+    kInterpolateAtOffset,
     kNone,
 };
 
@@ -150,9 +170,10 @@ const char* str(BuiltinFn i);
 
 /// Emits the name of the builtin function type. The spelling, including case,
 /// matches the name in the WGSL spec.
-template <typename STREAM, typename = traits::EnableIfIsOStream<STREAM>>
+template <typename STREAM>
+    requires(traits::IsOStream<STREAM>)
 auto& operator<<(STREAM& o, BuiltinFn i) {
-    return o << str(i);
+  return o << str(i);
 }
 
 /// @returns access restrictions for a function
@@ -160,5 +181,7 @@ tint::core::ir::Instruction::Accesses GetSideEffects(BuiltinFn fn);
 
 }  // namespace tint::spirv
 // \endcond
+
+// clang-format on
 
 #endif  // SRC_TINT_LANG_SPIRV_BUILTIN_FN_H_

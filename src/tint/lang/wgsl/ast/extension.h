@@ -29,7 +29,7 @@
 #define SRC_TINT_LANG_WGSL_AST_EXTENSION_H_
 
 #include "src/tint/lang/wgsl/ast/node.h"
-#include "src/tint/lang/wgsl/extension.h"
+#include "src/tint/lang/wgsl/enums.h"
 
 namespace tint::ast {
 
@@ -40,20 +40,13 @@ namespace tint::ast {
 class Extension final : public Castable<Extension, Node> {
   public:
     /// Create a extension
-    /// @param pid the identifier of the program that owns this node
     /// @param nid the unique node identifier
     /// @param src the source of this node
     /// @param ext the extension
-    Extension(GenerationID pid, NodeID nid, const Source& src, wgsl::Extension ext);
+    Extension(NodeID nid, const Source& src, wgsl::Extension ext);
 
     /// Destructor
     ~Extension() override;
-
-    /// Clones this node and all transitive child nodes using the `CloneContext`
-    /// `ctx`.
-    /// @param ctx the clone context
-    /// @return the newly cloned node
-    const Extension* Clone(CloneContext& ctx) const override;
 
     /// The extension name
     const wgsl::Extension name;

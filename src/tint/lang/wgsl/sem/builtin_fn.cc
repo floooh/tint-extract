@@ -31,10 +31,9 @@
 #include "src/tint/lang/wgsl/sem/builtin_fn.h"
 
 #include <utility>
-#include <vector>
 
 #include "src/tint/lang/core/intrinsic/table.h"
-#include "src/tint/utils/containers/transform.h"
+#include "src/tint/lang/core/type/texel_buffer.h"
 
 TINT_INSTANTIATE_TYPEINFO(tint::sem::BuiltinFn);
 
@@ -64,32 +63,8 @@ bool BuiltinFn::IsDeprecated() const {
     return overload_.flags.Contains(core::intrinsic::OverloadFlag::kIsDeprecated);
 }
 
-bool BuiltinFn::IsCoarseDerivative() const {
-    return wgsl::IsCoarseDerivative(fn_);
-}
-
-bool BuiltinFn::IsFineDerivative() const {
-    return wgsl::IsFineDerivative(fn_);
-}
-
 bool BuiltinFn::IsDerivative() const {
     return wgsl::IsDerivative(fn_);
-}
-
-bool BuiltinFn::IsTexture() const {
-    return wgsl::IsTexture(fn_);
-}
-
-bool BuiltinFn::IsImageQuery() const {
-    return wgsl::IsImageQuery(fn_);
-}
-
-bool BuiltinFn::IsDataPacking() const {
-    return wgsl::IsDataPacking(fn_);
-}
-
-bool BuiltinFn::IsDataUnpacking() const {
-    return wgsl::IsDataUnpacking(fn_);
 }
 
 bool BuiltinFn::IsBarrier() const {
@@ -112,12 +87,18 @@ bool BuiltinFn::IsSubgroupMatrix() const {
     return wgsl::IsSubgroupMatrix(fn_);
 }
 
-bool BuiltinFn::IsQuadSwap() const {
-    return wgsl::IsQuadSwap(fn_);
+bool BuiltinFn::IsTexelBuffer() const {
+    for (auto* param : Parameters()) {
+        if (param->Type()->UnwrapRef()->Is<core::type::TexelBuffer>()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
-bool BuiltinFn::HasSideEffects() const {
-    return wgsl::HasSideEffects(fn_);
+bool BuiltinFn::IsResourceTable() const {
+    return wgsl::IsResourceTable(fn_);
 }
 
 wgsl::LanguageFeature BuiltinFn::RequiredLanguageFeature() const {
@@ -126,6 +107,9 @@ wgsl::LanguageFeature BuiltinFn::RequiredLanguageFeature() const {
     }
     if (IsPacked4x8IntegerDotProductBuiltin()) {
         return wgsl::LanguageFeature::kPacked4X8IntegerDotProduct;
+    }
+    if (IsTexelBuffer()) {
+        return wgsl::LanguageFeature::kTexelBuffers;
     }
     return wgsl::LanguageFeature::kUndefined;
 }

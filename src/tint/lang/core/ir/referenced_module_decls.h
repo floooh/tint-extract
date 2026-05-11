@@ -117,10 +117,16 @@ class ReferencedModuleDecls {
                 continue;
             }
             auto* ary = ptr->UnwrapPtr()->template As<core::type::Array>();
-            if (!ary) {
+            auto* buf = ptr->UnwrapPtr()->template As<core::type::Buffer>();
+            if (!ary && !buf) {
                 continue;
             }
-            auto* cnt = ary->Count()->template As<core::ir::type::ValueArrayCount>();
+            const core::ir::type::ValueArrayCount* cnt = nullptr;
+            if (ary) {
+                cnt = ary->Count()->template As<core::ir::type::ValueArrayCount>();
+            } else if (buf) {
+                cnt = buf->Count()->template As<core::ir::type::ValueArrayCount>();
+            }
             if (!cnt || cnt->value->template Is<core::ir::Constant>()) {
                 continue;
             }
@@ -145,8 +151,8 @@ class ReferencedModuleDecls {
             DeclSet decls;
             GetTransitiveReferences(func ? func->Block() : nullptr, decls);
 
-            // For a compute entry point, we need to check if any of the workgroup sizes are built
-            // on overrides.
+            // For a compute entry point, we need to check if subgroup size or any of the workgroup
+            // sizes are built on overrides.
             if (func && func->Stage() == core::ir::Function::PipelineStage::kCompute) {
                 TINT_ASSERT(func->WorkgroupSize().has_value());
 
@@ -161,6 +167,13 @@ class ReferencedModuleDecls {
                     auto* inst = wg_size->template As<core::ir::InstructionResult>();
                     TINT_ASSERT(inst);
 
+                    AddToBlock(decls, inst->Instruction());
+                }
+                const auto subgroup_size = func->SubgroupSize();
+                if (subgroup_size.has_value() &&
+                    !((*subgroup_size)->template Is<core::ir::Constant>())) {
+                    auto* inst = (*subgroup_size)->template As<core::ir::InstructionResult>();
+                    TINT_ASSERT(inst);
                     AddToBlock(decls, inst->Instruction());
                 }
             }

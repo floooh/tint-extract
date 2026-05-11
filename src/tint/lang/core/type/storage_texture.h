@@ -30,15 +30,9 @@
 
 #include <string>
 
-#include "src/tint/lang/core/access.h"
-#include "src/tint/lang/core/texel_format.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/type/texture.h"
 #include "src/tint/lang/core/type/texture_dimension.h"
-
-// Forward declarations
-namespace tint::core::type {
-class Manager;
-}  // namespace tint::core::type
 
 namespace tint::core::type {
 

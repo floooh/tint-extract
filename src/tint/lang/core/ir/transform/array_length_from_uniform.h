@@ -31,6 +31,7 @@
 #include <unordered_map>
 
 #include "src/tint/api/common/binding_point.h"
+#include "src/tint/lang/core/ir/validator.h"
 #include "src/tint/utils/result.h"
 
 // Forward declarations.
@@ -39,6 +40,14 @@ class Module;
 }
 
 namespace tint::core::ir::transform {
+
+/// The capabilities that the transform can support.
+const Capabilities kArrayLengthFromUniformCapabilities{
+    Capability::kAllow8BitIntegers,
+    Capability::kAllow16BitIntegers,
+    Capability::kAllowDuplicateBindings,
+    Capability::kMslAllowEntryPointInterface,
+};
 
 /// The result of running the ArrayLengthFromUniform transform.
 struct ArrayLengthFromUniformResult {

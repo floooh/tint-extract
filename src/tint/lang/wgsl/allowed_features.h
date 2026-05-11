@@ -30,9 +30,8 @@
 
 #include <unordered_set>
 
-#include "src/tint/lang/wgsl/extension.h"
-#include "src/tint/lang/wgsl/language_feature.h"
-#include "src/tint/utils/reflection.h"
+#include "src/tint/lang/wgsl/enums.h"
+#include "src/tint/utils/reflection/reflection.h"
 
 namespace tint::wgsl {
 

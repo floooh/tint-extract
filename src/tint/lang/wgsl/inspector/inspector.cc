@@ -27,16 +27,15 @@
 
 #include "src/tint/lang/wgsl/inspector/inspector.h"
 
+#include <functional>
 #include <unordered_set>
 #include <utility>
 
-#include "src/tint/lang/core/builtin_value.h"
+#include "src/tint/api/common/resource_type.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/fluent_types.h"
-#include "src/tint/lang/core/interpolation_sampling.h"
-#include "src/tint/lang/core/interpolation_type.h"
 #include "src/tint/lang/core/type/array.h"
 #include "src/tint/lang/core/type/binding_array.h"
-#include "src/tint/lang/core/type/bool.h"
 #include "src/tint/lang/core/type/depth_multisampled_texture.h"
 #include "src/tint/lang/core/type/depth_texture.h"
 #include "src/tint/lang/core/type/external_texture.h"
@@ -45,7 +44,9 @@
 #include "src/tint/lang/core/type/i32.h"
 #include "src/tint/lang/core/type/input_attachment.h"
 #include "src/tint/lang/core/type/matrix.h"
+#include "src/tint/lang/core/type/memory_view.h"
 #include "src/tint/lang/core/type/multisampled_texture.h"
+#include "src/tint/lang/core/type/resource_type.h"
 #include "src/tint/lang/core/type/sampled_texture.h"
 #include "src/tint/lang/core/type/storage_texture.h"
 #include "src/tint/lang/core/type/u32.h"
@@ -55,17 +56,19 @@
 #include "src/tint/lang/wgsl/ast/id_attribute.h"
 #include "src/tint/lang/wgsl/ast/identifier.h"
 #include "src/tint/lang/wgsl/ast/identifier_expression.h"
-#include "src/tint/lang/wgsl/ast/input_attachment_index_attribute.h"
 #include "src/tint/lang/wgsl/ast/interpolate_attribute.h"
 #include "src/tint/lang/wgsl/ast/module.h"
 #include "src/tint/lang/wgsl/ast/override.h"
+#include "src/tint/lang/wgsl/ast/templated_identifier.h"
 #include "src/tint/lang/wgsl/sem/accessor_expression.h"
 #include "src/tint/lang/wgsl/sem/builtin_enum_expression.h"
+#include "src/tint/lang/wgsl/sem/builtin_fn.h"
 #include "src/tint/lang/wgsl/sem/call.h"
 #include "src/tint/lang/wgsl/sem/function.h"
 #include "src/tint/lang/wgsl/sem/module.h"
 #include "src/tint/lang/wgsl/sem/statement.h"
 #include "src/tint/lang/wgsl/sem/struct.h"
+#include "src/tint/lang/wgsl/sem/type_expression.h"
 #include "src/tint/lang/wgsl/sem/variable.h"
 #include "src/tint/utils/containers/unique_vector.h"
 #include "src/tint/utils/math/math.h"
@@ -116,7 +119,8 @@ std::tuple<ComponentType, CompositionType> CalculateComponentAndComposition(
     return {componentType, compositionType};
 }
 
-ResourceBinding ConvertBufferToResourceBinding(const tint::sem::GlobalVariable* buffer) {
+ResourceBinding ConvertBufferToResourceBinding(const tint::sem::GlobalVariable* buffer,
+                                               std::optional<uint64_t> buffer_size = std::nullopt) {
     ResourceBinding result;
     result.bind_group = buffer->Attributes().binding_point->group;
     result.binding = buffer->Attributes().binding_point->binding;
@@ -124,6 +128,9 @@ ResourceBinding ConvertBufferToResourceBinding(const tint::sem::GlobalVariable* 
 
     auto* unwrapped_type = buffer->Type()->UnwrapRef();
     result.size = unwrapped_type->Size();
+    if (buffer_size) {
+        result.size = static_cast<uint32_t>(buffer_size.value());
+    }
     result.size_no_padding = result.size;
     if (auto* str = unwrapped_type->As<sem::Struct>()) {
         result.size_no_padding = str->SizeNoPadding();
@@ -162,23 +169,25 @@ ResourceBinding ConvertHandleToResourceBinding(const tint::sem::GlobalVariable* 
         handle_type,
 
         [&](const core::type::Sampler* sampler) {
-            if (sampler->Kind() == core::type::SamplerKind::kSampler) {
-                result.resource_type = ResourceBinding::ResourceType::kSampler;
-            } else {
-                TINT_ASSERT(sampler->Kind() == core::type::SamplerKind::kComparisonSampler);
-                result.resource_type = ResourceBinding::ResourceType::kComparisonSampler;
-            }
+            result.resource_type = ResourceBinding::ResourceType::kSampler;
+            result.sampler_type = SamplerToSamplerType(sampler);
         },
-
         [&](const core::type::SampledTexture* tex) {
             result.resource_type = ResourceBinding::ResourceType::kSampledTexture;
             result.dim = TypeTextureDimensionToResourceBindingTextureDimension(tex->Dim());
-            result.sampled_kind = BaseTypeToSampledKind(tex->Type());
+            result.sampled_kind = ToFilterableSampledKind(tex);
         },
         [&](const core::type::MultisampledTexture* tex) {
             result.resource_type = ResourceBinding::ResourceType::kMultisampledTexture;
             result.dim = TypeTextureDimensionToResourceBindingTextureDimension(tex->Dim());
-            result.sampled_kind = BaseTypeToSampledKind(tex->Type());
+
+            auto kind = BaseTypeToSampledKind(tex->Type());
+            // The base `f32` type will be `Float` but for a multisampled it is always
+            // an unfilterable.
+            if (kind == ResourceBinding::SampledKind::kFloat) {
+                kind = ResourceBinding::SampledKind::kUnfilterable;
+            }
+            result.sampled_kind = kind;
         },
         [&](const core::type::DepthTexture* tex) {
             result.resource_type = ResourceBinding::ResourceType::kDepthTexture;
@@ -209,6 +218,23 @@ ResourceBinding ConvertHandleToResourceBinding(const tint::sem::GlobalVariable* 
         [&](const core::type::ExternalTexture*) {
             result.resource_type = ResourceBinding::ResourceType::kExternalTexture;
             result.dim = ResourceBinding::TextureDimension::k2d;
+        },
+        [&](const core::type::TexelBuffer* tex) {
+            result.resource_type = ResourceBinding::ResourceType::kReadWriteTexelBuffer;
+            switch (tex->Access()) {
+                case core::Access::kRead:
+                    result.resource_type = ResourceBinding::ResourceType::kReadOnlyTexelBuffer;
+                    break;
+                case core::Access::kReadWrite:
+                    result.resource_type = ResourceBinding::ResourceType::kReadWriteTexelBuffer;
+                    break;
+                case core::Access::kWrite:
+                case core::Access::kUndefined:
+                    TINT_UNREACHABLE() << "unhandled texel buffer access";
+            }
+            result.dim = TypeTextureDimensionToResourceBindingTextureDimension(tex->Dim());
+            result.sampled_kind = BaseTypeToSampledKind(tex->Type());
+            result.image_format = TypeTexelFormatToResourceBindingTexelFormat(tex->TexelFormat());
         },
 
         [&](const core::type::InputAttachment* attachment) {
@@ -252,6 +278,30 @@ inspector::Override MkOverride(const sem::GlobalVariable* global, OverrideId id)
     return override;
 }
 
+bool IsFineDerivativeBuiltin(const sem::BuiltinFn* builtin) {
+    auto fn = builtin->Fn();
+    return fn == wgsl::BuiltinFn::kDpdxFine || fn == wgsl::BuiltinFn::kDpdyFine ||
+           fn == wgsl::BuiltinFn::kFwidthFine;
+}
+
+bool UsesFineDerivatives(const sem::Function* func) {
+    for (auto& b : func->DirectlyCalledBuiltins()) {
+        if (IsFineDerivativeBuiltin(b)) {
+            return true;
+        }
+    }
+
+    for (auto& call : func->TransitivelyCalledFunctions()) {
+        for (auto& b : call->DirectlyCalledBuiltins()) {
+            if (IsFineDerivativeBuiltin(b)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 }  // namespace
 
 Inspector::Inspector(const Program& program) : program_(program) {}
@@ -266,12 +316,10 @@ EntryPoint Inspector::GetEntryPoint(const tint::ast::Function* func) {
     auto* sem = program_.Sem().Get(func);
 
     entry_point.name = func->name->symbol.Name();
-    entry_point.remapped_name = func->name->symbol.Name();
 
     switch (func->PipelineStage()) {
         case ast::PipelineStage::kCompute: {
             entry_point.stage = PipelineStage::kCompute;
-            entry_point.workgroup_storage_size = ComputeWorkgroupStorageSize(func);
 
             auto wgsize = sem->WorkgroupSize();
             if (wgsize[0].has_value() && wgsize[1].has_value() && wgsize[2].has_value()) {
@@ -298,7 +346,7 @@ EntryPoint Inspector::GetEntryPoint(const tint::ast::Function* func) {
         }
     }
 
-    entry_point.push_constant_size = ComputePushConstantSize(func);
+    entry_point.immediate_data_size = ComputeImmediateDataSize(func);
 
     for (auto* param : sem->Parameters()) {
         AddEntryPointInOutVariables(
@@ -306,8 +354,6 @@ EntryPoint Inspector::GetEntryPoint(const tint::ast::Function* func) {
             param->Type(), param->Declaration()->attributes, param->Attributes().location,
             param->Attributes().color, /* @blend_src */ std::nullopt, entry_point.input_variables);
 
-        entry_point.input_position_used |= ContainsBuiltin(
-            core::BuiltinValue::kPosition, param->Type(), param->Declaration()->attributes);
         entry_point.front_facing_used |= ContainsBuiltin(
             core::BuiltinValue::kFrontFacing, param->Type(), param->Declaration()->attributes);
         entry_point.sample_index_used |= ContainsBuiltin(
@@ -316,10 +362,33 @@ EntryPoint Inspector::GetEntryPoint(const tint::ast::Function* func) {
             core::BuiltinValue::kSampleMask, param->Type(), param->Declaration()->attributes);
         entry_point.num_workgroups_used |= ContainsBuiltin(
             core::BuiltinValue::kNumWorkgroups, param->Type(), param->Declaration()->attributes);
+        // global_invocation_index and workgroup_index are polyfilled using num_workgroups
+        entry_point.num_workgroups_used |= ContainsBuiltin(
+            core::BuiltinValue::kWorkgroupIndex, param->Type(), param->Declaration()->attributes);
+        entry_point.num_workgroups_used |=
+            ContainsBuiltin(core::BuiltinValue::kGlobalInvocationIndex, param->Type(),
+                            param->Declaration()->attributes);
         entry_point.vertex_index_used |= ContainsBuiltin(
             core::BuiltinValue::kVertexIndex, param->Type(), param->Declaration()->attributes);
         entry_point.instance_index_used |= ContainsBuiltin(
             core::BuiltinValue::kInstanceIndex, param->Type(), param->Declaration()->attributes);
+        entry_point.primitive_index_used |= ContainsBuiltin(
+            core::BuiltinValue::kPrimitiveIndex, param->Type(), param->Declaration()->attributes);
+        entry_point.subgroup_invocation_id_used |=
+            ContainsBuiltin(core::BuiltinValue::kSubgroupInvocationId, param->Type(),
+                            param->Declaration()->attributes);
+        entry_point.subgroup_size_used |= ContainsBuiltin(
+            core::BuiltinValue::kSubgroupSize, param->Type(), param->Declaration()->attributes);
+        entry_point.global_invocation_index_used |=
+            ContainsBuiltin(core::BuiltinValue::kGlobalInvocationIndex, param->Type(),
+                            param->Declaration()->attributes);
+        entry_point.workgroup_index_used |= ContainsBuiltin(
+            core::BuiltinValue::kWorkgroupIndex, param->Type(), param->Declaration()->attributes);
+
+        if (entry_point.stage == PipelineStage::kFragment) {
+            entry_point.frag_position_used = ContainsBuiltin(
+                core::BuiltinValue::kPosition, param->Type(), param->Declaration()->attributes);
+        }
     }
 
     if (!sem->ReturnType()->Is<core::type::Void>()) {
@@ -347,6 +416,8 @@ EntryPoint Inspector::GetEntryPoint(const tint::ast::Function* func) {
     entry_point.has_depth_texture_with_non_comparison_sampler =
         texture_metadata.has_depth_texture_with_non_comparison_sampler;
 
+    entry_point.fine_derivative_builtin_used = UsesFineDerivatives(sem);
+
     return entry_point;
 }
 
@@ -367,46 +438,6 @@ std::vector<EntryPoint> Inspector::GetEntryPoints() {
         }
 
         result.push_back(GetEntryPoint(func));
-    }
-
-    return result;
-}
-
-std::map<OverrideId, Scalar> Inspector::GetOverrideDefaultValues() {
-    std::map<OverrideId, Scalar> result;
-    for (auto* var : program_.AST().GlobalVariables()) {
-        auto* global = program_.Sem().Get<sem::GlobalVariable>(var);
-        if (!global || !global->Declaration()->Is<ast::Override>()) {
-            continue;
-        }
-
-        // If there are conflicting definitions for an override id, that is invalid
-        // WGSL, so the resolver should catch it. Thus here the inspector just
-        // assumes all definitions of the override id are the same, so only needs
-        // to find the first reference to override id.
-        auto override_id = global->Attributes().override_id.value();
-        if (result.find(override_id) != result.end()) {
-            continue;
-        }
-
-        if (global->Initializer()) {
-            if (auto* value = global->Initializer()->ConstantValue()) {
-                result[override_id] = Switch(
-                    value->Type(),  //
-                    [&](const core::type::I32*) { return Scalar(value->ValueAs<i32>()); },
-                    [&](const core::type::U32*) { return Scalar(value->ValueAs<u32>()); },
-                    [&](const core::type::F32*) { return Scalar(value->ValueAs<f32>()); },
-                    [&](const core::type::F16*) {
-                        // Default value of f16 override is also stored as float scalar.
-                        return Scalar(static_cast<float>(value->ValueAs<f16>()));
-                    },
-                    [&](const core::type::Bool*) { return Scalar(value->ValueAs<bool>()); });
-                continue;
-            }
-        }
-
-        // No const-expression initializer for the override
-        result[override_id] = Scalar();
     }
 
     return result;
@@ -438,7 +469,7 @@ std::vector<ResourceBinding> Inspector::GetResourceBindings(const std::string& e
             case core::AddressSpace::kPrivate:
             case core::AddressSpace::kFunction:
             case core::AddressSpace::kWorkgroup:
-            case core::AddressSpace::kPushConstant:
+            case core::AddressSpace::kImmediate:
             case core::AddressSpace::kPixelLocal:
             case core::AddressSpace::kIn:
             case core::AddressSpace::kOut:
@@ -446,9 +477,11 @@ std::vector<ResourceBinding> Inspector::GetResourceBindings(const std::string& e
                 continue;
 
             case core::AddressSpace::kUniform:
-            case core::AddressSpace::kStorage:
-                result.push_back(ConvertBufferToResourceBinding(global));
+            case core::AddressSpace::kStorage: {
+                auto size = func_sem->TransitivelyReferencedUnsizedBufferSize(global);
+                result.push_back(ConvertBufferToResourceBinding(global, size));
                 break;
+            }
             case core::AddressSpace::kHandle:
                 result.push_back(ConvertHandleToResourceBinding(global));
                 break;
@@ -553,8 +586,25 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
             argument = access->Object();
         }
 
-        // Handle parameter can only be identifiers.
+        // The handle param could come in a few different forms, either it's associated to a
+        // `GlobalVariable` or as a `Parameter`. Those are the more common case. With
+        // `texture_and_sampler_let` it can also come through a chain of let assignments, so we have
+        // to walk through any `LocalVariable` entries until we get to first non-`LocalVariable`.
+        // The last option is that as we walk up the let chain, we no longer find a `RootIdentifier`
+        // this can happen when a `getResource` is assigned into a `let`. In that case, we just
+        // bail out early and return an empty set as there _is no_ global handle argument.
         auto* identifier = argument->RootIdentifier();
+
+        // With `texture_and_sampler_let` the variable maybe in a let and we need to trace the
+        // initializer of the let.
+        auto* local = identifier->As<sem::LocalVariable>();
+        while (local != nullptr) {
+            identifier = local->Initializer()->RootIdentifier();
+            if (!identifier) {
+                return scratch_global;
+            }
+            local = identifier->As<sem::LocalVariable>();
+        }
 
         return tint::Switch(
             identifier,
@@ -572,9 +622,6 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
     // set of statically determined globals for the texture and sampler arguments.
     auto RecordBuiltinCallMetadata = [&](const sem::Call* call, const sem::BuiltinFn* builtin,
                                          const GlobalSet& textures, const GlobalSet& samplers) {
-        // All builtins with samplers also take a texture.
-        TINT_ASSERT(!textures.IsEmpty());
-
         // Compute the statically used texture+sampler pairs.
         for (const auto* sampler : samplers) {
             auto sampler_binding_point = sampler->Attributes().binding_point.value();
@@ -598,6 +645,7 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
         }
 
         bool uses_num_levels = false;
+        bool uses_num_samples = false;
         switch (builtin->Fn()) {
             case wgsl::BuiltinFn::kTextureNumLevels:
                 uses_num_levels = true;
@@ -613,6 +661,9 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
                 // textureLoad uses textureNumLevels to clamp the level, unless the texture type
                 // doesn't support mipmapping.
                 uses_num_levels = !texture_type->IsAnyOf<core::type::MultisampledTexture,
+                                                         core::type::DepthMultisampledTexture,
+                                                         core::type::ExternalTexture>();
+                uses_num_samples = texture_type->IsAnyOf<core::type::MultisampledTexture,
                                                          core::type::DepthMultisampledTexture>();
                 metadata.has_texture_load_with_depth_texture |=
                     texture_type
@@ -628,10 +679,7 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
                 break;
 
             case wgsl::BuiltinFn::kTextureNumSamples:
-                for (const auto* texture : textures) {
-                    auto texture_binding_point = texture->Attributes().binding_point.value();
-                    metadata.textures_with_num_samples.insert(texture_binding_point);
-                }
+                uses_num_samples = true;
                 break;
 
             default:
@@ -642,6 +690,12 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
             for (const auto* texture : textures) {
                 auto texture_binding_point = texture->Attributes().binding_point.value();
                 metadata.textures_with_num_levels.insert(texture_binding_point);
+            }
+        }
+        if (uses_num_samples) {
+            for (const auto* texture : textures) {
+                auto texture_binding_point = texture->Attributes().binding_point.value();
+                metadata.textures_with_num_samples.insert(texture_binding_point);
             }
         }
     };
@@ -685,6 +739,12 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
                         return;
                     }
 
+                    // A texture of `sem::Call` means we're dealing with a `getResource` or
+                    // `hasResource` call. Skip it.
+                    if (call->Arguments()[size_t(texture_index)]->Is<sem::Call>()) {
+                        return;
+                    }
+
                     // Compute the set of globals used for the texture/sampler parameter.
                     // It will either point to a GlobalSet on the stack when a global is used
                     // directly, or to the contents of globals_for_handle_parameters.
@@ -707,6 +767,63 @@ const Inspector::EntryPointTextureMetadata& Inspector::ComputeTextureMetadata(
     return metadata;
 }
 
+std::bitset<kImmediateSlotCount> Inspector::GetImmediateBlockInfo(const std::string& entry_point) {
+    auto* func = FindEntryPointByName(entry_point);
+    if (!func) {
+        return {};
+    }
+
+    auto* func_sem = program_.Sem().Get(func);
+
+    const sem::GlobalVariable* immediate_var = nullptr;
+    for (const sem::Variable* var : func_sem->TransitivelyReferencedGlobals()) {
+        if (var->AddressSpace() == core::AddressSpace::kImmediate) {
+            immediate_var = var->As<sem::GlobalVariable>();
+            break;
+        }
+    }
+
+    if (!immediate_var) {
+        return {};
+    }
+
+    auto* mv = immediate_var->Type()->As<core::type::MemoryView>();
+    auto* type = mv->StoreType();
+
+    std::bitset<kImmediateSlotCount> accessible_slots;
+
+    std::function<void(const core::type::Type*, uint32_t)> mark_slots =
+        [&](const core::type::Type* t, uint32_t offset) {
+            tint::Switch(
+                t,
+                [&](const sem::Struct* str) {
+                    for (auto* member : str->Members()) {
+                        mark_slots(member->Type(), offset + member->Offset());
+                    }
+                },
+                [&](const core::type::Matrix* mat) {
+                    uint32_t col_stride = mat->ColumnStride();
+                    for (uint32_t i = 0; i < mat->Columns(); i++) {
+                        mark_slots(mat->ColumnType(), offset + i * col_stride);
+                    }
+                },
+                [&](const core::type::Type* other) {
+                    uint32_t s = other->Size();
+                    uint32_t start_slot = offset / kImmediateSlotSize;
+                    uint32_t end_byte = offset + s;
+                    uint32_t end_slot = (end_byte - 1) / kImmediateSlotSize;
+                    for (uint32_t i = start_slot; i <= end_slot; i++) {
+                        TINT_ASSERT(i < accessible_slots.size());
+                        accessible_slots[i] = true;
+                    }
+                });
+        };
+
+    mark_slots(type, 0);
+
+    return accessible_slots;
+}
+
 std::vector<std::string> Inspector::GetUsedExtensionNames() {
     auto& extensions = program_.Sem().Module()->Extensions();
     std::vector<std::string> out;
@@ -715,22 +832,6 @@ std::vector<std::string> Inspector::GetUsedExtensionNames() {
         out.push_back(tint::ToString(ext));
     }
     return out;
-}
-
-std::vector<std::pair<std::string, Source>> Inspector::GetEnableDirectives() {
-    std::vector<std::pair<std::string, Source>> result;
-
-    // Ast nodes for enable directive are stored within global declarations list
-    auto global_decls = program_.AST().GlobalDeclarations();
-    for (auto* node : global_decls) {
-        if (auto* enable = node->As<ast::Enable>()) {
-            for (auto* ext : enable->extensions) {
-                result.push_back({tint::ToString(ext->name), ext->source});
-            }
-        }
-    }
-
-    return result;
 }
 
 const ast::Function* Inspector::FindEntryPointByName(const std::string& name) {
@@ -823,9 +924,7 @@ std::optional<uint32_t> Inspector::GetClipDistancesBuiltinSize(const core::type:
             if (ContainsBuiltin(core::BuiltinValue::kClipDistances, member->Type(),
                                 member->Declaration()->attributes)) {
                 auto* array_type = member->Type()->As<core::type::Array>();
-                if (DAWN_UNLIKELY(array_type == nullptr)) {
-                    TINT_ICE() << "clip_distances is not an array";
-                }
+                TINT_ASSERT(array_type != nullptr) << "clip_distances is not an array";
                 return array_type->ConstantCount();
             }
         }
@@ -893,31 +992,11 @@ std::tuple<InterpolationType, InterpolationSampling> Inspector::CalculateInterpo
     return {interpolation_type, sampling_type};
 }
 
-uint32_t Inspector::ComputeWorkgroupStorageSize(const ast::Function* func) const {
-    uint32_t total_size = 0;
-    auto* func_sem = program_.Sem().Get(func);
-    for (const sem::Variable* var : func_sem->TransitivelyReferencedGlobals()) {
-        if (var->AddressSpace() == core::AddressSpace::kWorkgroup) {
-            auto* ty = var->Type()->UnwrapRef();
-            uint32_t align = ty->Align();
-            uint32_t size = ty->Size();
-
-            // This essentially matches std430 layout rules from GLSL, which are in
-            // turn specified as an upper bound for Vulkan layout sizing. Since D3D
-            // and Metal are even less specific, we assume Vulkan behavior as a
-            // good-enough approximation everywhere.
-            total_size += tint::RoundUp(16u, tint::RoundUp(align, size));
-        }
-    }
-
-    return total_size;
-}
-
-uint32_t Inspector::ComputePushConstantSize(const ast::Function* func) const {
+uint32_t Inspector::ComputeImmediateDataSize(const ast::Function* func) const {
     uint32_t size = 0;
     auto* func_sem = program_.Sem().Get(func);
     for (const sem::Variable* var : func_sem->TransitivelyReferencedGlobals()) {
-        if (var->AddressSpace() == core::AddressSpace::kPushConstant) {
+        if (var->AddressSpace() == core::AddressSpace::kImmediate) {
             size += var->Type()->UnwrapRef()->Size();
         }
     }
@@ -977,6 +1056,50 @@ std::vector<Override> Inspector::Overrides() {
         results.push_back(MkOverride(global, global->Attributes().override_id.value()));
     }
     return results;
+}
+
+std::unordered_set<ResourceType> Inspector::GetResourceTableInfo(const std::string& entry_point) {
+    auto* func = FindEntryPointByName(entry_point);
+    if (!func) {
+        return {};
+    }
+
+    auto& sem = program_.Sem();
+    Symbol entry_point_symbol = program_.Symbols().Get(entry_point);
+
+    std::unordered_set<ResourceType> types;
+
+    auto declarations = sem.Module()->DependencyOrderedDeclarations();
+    for (auto rit = declarations.rbegin(); rit != declarations.rend(); rit++) {
+        auto* fn = sem.Get<sem::Function>(*rit);
+        if ((fn == nullptr) || !fn->HasCallGraphEntryPoint(entry_point_symbol)) {
+            continue;
+        }
+
+        for (auto* call : fn->DirectCalls()) {
+            tint::Switch(
+                call->Target(),  //
+                [&](const sem::BuiltinFn* builtin) {
+                    if (builtin->Fn() != wgsl::BuiltinFn::kHasResource &&
+                        builtin->Fn() != wgsl::BuiltinFn::kGetResource) {
+                        return;
+                    }
+
+                    auto* decl = call->Declaration();
+                    const auto* ident = decl->target->identifier->As<ast::TemplatedIdentifier>();
+
+                    TINT_ASSERT(ident);
+                    TINT_ASSERT(ident->arguments.Length() == 1);
+
+                    auto* type_expr = sem.Get(ident->arguments[0])->As<sem::TypeExpression>();
+                    TINT_ASSERT(type_expr);
+
+                    types.insert(core::type::TypeToResourceType(type_expr->Type()));
+                });
+        }
+    }
+
+    return types;
 }
 
 }  // namespace tint::inspector

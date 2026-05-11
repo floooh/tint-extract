@@ -27,6 +27,7 @@
 
 #include "src/tint/lang/wgsl/inspector/resource_binding.h"
 
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/type/array.h"
 #include "src/tint/lang/core/type/f32.h"
 #include "src/tint/lang/core/type/i32.h"
@@ -59,33 +60,99 @@ ResourceBinding::TextureDimension TypeTextureDimensionToResourceBindingTextureDi
     return ResourceBinding::TextureDimension::kNone;
 }
 
-ResourceBinding::SampledKind BaseTypeToSampledKind(const core::type::Type* base_type) {
-    if (!base_type) {
-        return ResourceBinding::SampledKind::kUnknown;
+ResourceBinding::SampledKind ToFilterableSampledKind(const core::type::SampledTexture* tex) {
+    switch (tex->Filterable()) {
+        case core::TextureFilterable::kFilterable:
+            return ResourceBinding::SampledKind::kFilterable;
+        case core::TextureFilterable::kUnfilterable:
+            return ResourceBinding::SampledKind::kUnfilterable;
+        default:
+            break;
+    }
+    // We don't want to say `float` in this case, we want `unknown-filterable` to signify the
+    // unknown filterablity.
+    if (tex->Type()->Is<core::type::F32>()) {
+        return ResourceBinding::SampledKind::kUnknownFilterable;
     }
 
-    if (auto* at = base_type->As<core::type::Array>()) {
-        base_type = at->ElemType();
-    } else if (auto* mt = base_type->As<core::type::Matrix>()) {
-        base_type = mt->Type();
-    } else if (auto* vt = base_type->As<core::type::Vector>()) {
-        base_type = vt->Type();
-    }
+    return BaseTypeToSampledKind(tex->Type());
+}
+
+ResourceBinding::SampledKind BaseTypeToSampledKind(const core::type::Type* base_type) {
+    TINT_ASSERT(base_type);
 
     if (base_type->Is<core::type::F32>()) {
         return ResourceBinding::SampledKind::kFloat;
-    } else if (base_type->Is<core::type::U32>()) {
-        return ResourceBinding::SampledKind::kUInt;
-    } else if (base_type->Is<core::type::I32>()) {
-        return ResourceBinding::SampledKind::kSInt;
-    } else {
-        return ResourceBinding::SampledKind::kUnknown;
     }
+    if (base_type->Is<core::type::U32>()) {
+        return ResourceBinding::SampledKind::kUInt;
+    }
+    if (base_type->Is<core::type::I32>()) {
+        return ResourceBinding::SampledKind::kSInt;
+    }
+    TINT_UNREACHABLE();
+}
+
+ResourceBinding::SamplerType SamplerToSamplerType(const core::type::Sampler* sampler) {
+    if (sampler->Kind() == core::type::SamplerKind::kSampler) {
+        switch (sampler->Filtering()) {
+            case core::SamplerFiltering::kFiltering:
+                return ResourceBinding::SamplerType::kFiltering;
+            case core::SamplerFiltering::kNonFiltering:
+                return ResourceBinding::SamplerType::kNonFiltering;
+            default:
+                return ResourceBinding::SamplerType::kUnknownFiltering;
+        }
+    }
+    if (sampler->Kind() == core::type::SamplerKind::kComparisonSampler) {
+        return ResourceBinding::SamplerType::kComparison;
+    }
+    TINT_UNREACHABLE();
 }
 
 ResourceBinding::TexelFormat TypeTexelFormatToResourceBindingTexelFormat(
     const core::TexelFormat& image_format) {
     switch (image_format) {
+        case core::TexelFormat::kR8Snorm:
+            return ResourceBinding::TexelFormat::kR8Snorm;
+        case core::TexelFormat::kR8Uint:
+            return ResourceBinding::TexelFormat::kR8Uint;
+        case core::TexelFormat::kR8Sint:
+            return ResourceBinding::TexelFormat::kR8Sint;
+        case core::TexelFormat::kRg8Unorm:
+            return ResourceBinding::TexelFormat::kRg8Unorm;
+        case core::TexelFormat::kRg8Snorm:
+            return ResourceBinding::TexelFormat::kRg8Snorm;
+        case core::TexelFormat::kRg8Uint:
+            return ResourceBinding::TexelFormat::kRg8Uint;
+        case core::TexelFormat::kRg8Sint:
+            return ResourceBinding::TexelFormat::kRg8Sint;
+        case core::TexelFormat::kR16Unorm:
+            return ResourceBinding::TexelFormat::kR16Unorm;
+        case core::TexelFormat::kR16Snorm:
+            return ResourceBinding::TexelFormat::kR16Snorm;
+        case core::TexelFormat::kR16Uint:
+            return ResourceBinding::TexelFormat::kR16Uint;
+        case core::TexelFormat::kR16Sint:
+            return ResourceBinding::TexelFormat::kR16Sint;
+        case core::TexelFormat::kR16Float:
+            return ResourceBinding::TexelFormat::kR16Float;
+        case core::TexelFormat::kRg16Unorm:
+            return ResourceBinding::TexelFormat::kRg16Unorm;
+        case core::TexelFormat::kRg16Snorm:
+            return ResourceBinding::TexelFormat::kRg16Snorm;
+        case core::TexelFormat::kRg16Uint:
+            return ResourceBinding::TexelFormat::kRg16Uint;
+        case core::TexelFormat::kRg16Sint:
+            return ResourceBinding::TexelFormat::kRg16Sint;
+        case core::TexelFormat::kRg16Float:
+            return ResourceBinding::TexelFormat::kRg16Float;
+        case core::TexelFormat::kRgb10A2Uint:
+            return ResourceBinding::TexelFormat::kRgb10A2Uint;
+        case core::TexelFormat::kRgb10A2Unorm:
+            return ResourceBinding::TexelFormat::kRgb10A2Unorm;
+        case core::TexelFormat::kRg11B10Ufloat:
+            return ResourceBinding::TexelFormat::kRg11B10Ufloat;
         case core::TexelFormat::kBgra8Unorm:
             return ResourceBinding::TexelFormat::kBgra8Unorm;
         case core::TexelFormat::kR32Uint:
@@ -108,6 +175,10 @@ ResourceBinding::TexelFormat TypeTexelFormatToResourceBindingTexelFormat(
             return ResourceBinding::TexelFormat::kRg32Sint;
         case core::TexelFormat::kRg32Float:
             return ResourceBinding::TexelFormat::kRg32Float;
+        case core::TexelFormat::kRgba16Unorm:
+            return ResourceBinding::TexelFormat::kRgba16Unorm;
+        case core::TexelFormat::kRgba16Snorm:
+            return ResourceBinding::TexelFormat::kRgba16Snorm;
         case core::TexelFormat::kRgba16Uint:
             return ResourceBinding::TexelFormat::kRgba16Uint;
         case core::TexelFormat::kRgba16Sint:

@@ -37,21 +37,22 @@
 #include "src/tint/lang/core/ir/instruction.h"
 #include "src/tint/lang/core/ir/value.h"
 #include "src/tint/lang/core/type/manager.h"
-#include "src/tint/utils/containers/const_propagating_ptr.h"
 #include "src/tint/utils/containers/filtered_iterator.h"
 #include "src/tint/utils/containers/vector.h"
 #include "src/tint/utils/diagnostic/source.h"
-#include "src/tint/utils/generation_id.h"
 #include "src/tint/utils/memory/block_allocator.h"
 #include "src/tint/utils/symbol/symbol_table.h"
 
 namespace tint::core::ir {
 
+// Wrappers around the base TINT_ICE() macros that use the ice_callback attached to the module.
+#define TINT_IR_ICE(module) TINT_ICE(module.ice_callback)
+#define TINT_IR_UNREACHABLE(module) TINT_UNREACHABLE(module.ice_callback)
+#define TINT_IR_UNIMPLEMENTED(module) TINT_UNIMPLEMENTED(module.ice_callback)
+#define TINT_IR_ASSERT(module, condition) TINT_ASSERT((condition), module.ice_callback)
+
 /// Main module class for the IR.
 class Module {
-    /// Program Id required to create other components
-    GenerationID prog_id_;
-
     /// Map of value to name
     Hashmap<const Value*, Symbol, 32> value_to_name_;
 
@@ -178,6 +179,10 @@ class Module {
     /// @returns the functions in the module, in dependency order
     Vector<const Function*, 16> DependencyOrderedFunctions() const;
 
+    /// Removes `func` from the module and destroys it.
+    /// @param func the function to destroy
+    void Destroy(Function* func);
+
     /// The block allocator
     BlockAllocator<Block> blocks;
 
@@ -185,16 +190,25 @@ class Module {
     core::constant::Manager constant_values;
 
     /// List of functions in the module.
-    Vector<ConstPropagatingPtr<Function>, 8> functions;
+    Vector<Function*, 8> functions;
 
     /// The block containing module level declarations, if any exist.
-    ConstPropagatingPtr<Block> root_block;
+    Block* root_block = nullptr;
 
     /// The symbol table for the module
-    SymbolTable symbols{prog_id_};
+    SymbolTable symbols{};
 
     /// The map of core::constant::Value to their ir::Constant.
     Hashmap<const core::constant::Value*, ir::Constant*, 16> constants;
+
+    /// If true, the AssertValid*() methods will perform validation.
+    bool enable_validation_asserts = false;
+
+    /// If true, dump the IR whenever validation is performed.
+    bool dump_ir_when_validating = false;
+
+    /// An optional callback to receive an ICE generated while processing this module.
+    InternalCompilerErrorCallback ice_callback;
 
   private:
     /// @returns the next instruction id for this module

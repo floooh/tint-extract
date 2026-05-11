@@ -37,10 +37,6 @@
 #include "src/tint/utils/containers/vector.h"
 
 // Forward declarations
-namespace tint {
-class ProgramBuilder;
-class SymbolTable;
-}  // namespace tint
 namespace tint::core::type {
 class Type;
 }  // namespace tint::core::type
@@ -170,8 +166,6 @@ class Type : public Castable<Type, UniqueNode> {
     bool IsBoolScalarOrVector() const;
     /// @returns true if this type is boolean vector
     bool IsBoolVector() const;
-    /// @returns true if this type is a vector of scalar type
-    bool IsScalarVector() const;
     /// @returns true if this type is a numeric scale or vector
     bool IsNumericScalarOrVector() const;
     /// @returns true if this type is a handle type

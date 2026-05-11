@@ -31,7 +31,7 @@
 #include <string>
 #include <utility>
 
-#include "src/tint/lang/core/builtin_fn.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/intrinsic/table.h"
 #include "src/tint/lang/core/ir/constant.h"
 #include "src/tint/lang/core/ir/core_binary.h"
@@ -98,7 +98,7 @@ diag::Diagnostic& ConstParamValidator::AddError(const Instruction& inst) {
 }
 
 const constant::Value* GetConstArg(const CoreBuiltinCall* call, uint32_t param_index) {
-    if (call->Args().Length() <= param_index) {
+    if (call->Args().size() <= param_index) {
         return nullptr;
     }
     if (call->Args()[param_index] == nullptr) {

@@ -33,21 +33,15 @@
 #include <utility>
 
 #include "src/tint/lang/core/binary_op.h"
-#include "src/tint/lang/core/builtin_fn.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/evaluation_stage.h"
 #include "src/tint/lang/core/intrinsic/ctor_conv.h"
 #include "src/tint/lang/core/intrinsic/table_data.h"
-#include "src/tint/lang/core/parameter_usage.h"
 #include "src/tint/lang/core/unary_op.h"
 #include "src/tint/utils/containers/vector.h"
 #include "src/tint/utils/text/string.h"
 #include "src/tint/utils/text/string_stream.h"
 #include "src/tint/utils/text/styled_text.h"
-
-// Forward declarations
-namespace tint::diag {
-class List;
-}  // namespace tint::diag
 
 namespace tint::core::intrinsic {
 
@@ -61,12 +55,14 @@ struct Overload {
         const core::type::Type* const type;
         /// Parameter usage
         core::ParameterUsage const usage = core::ParameterUsage::kNone;
+        /// True if the parameter is required to be const.
+        const bool is_const;
 
         /// Equality operator
         /// @param other the parameter to compare against
         /// @returns true if this parameter and @p other are the same
         bool operator==(const Parameter& other) const {
-            return type == other.type && usage == other.usage;
+            return type == other.type && usage == other.usage && is_const == other.is_const;
         }
 
         /// Inequality operator

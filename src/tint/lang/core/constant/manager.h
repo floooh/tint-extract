@@ -39,6 +39,7 @@
 
 namespace tint::core::constant {
 class Splat;
+class String;
 
 template <typename T>
 class Scalar;
@@ -65,21 +66,6 @@ class Manager final {
 
     /// Destructor
     ~Manager();
-
-    /// Wrap returns a new Manager created with the constants and types of `inner`.
-    /// The Manager returned by Wrap is intended to temporarily extend the constants and types of an
-    /// existing immutable Manager. As the copied constants and types are owned by `inner`, `inner`
-    /// must not be destructed or assigned while using the returned Manager.
-    /// TODO(crbug.com/tint/460) - Evaluate whether there are safer alternatives to this
-    /// function.
-    /// @param inner the immutable Manager to extend
-    /// @return the Manager that wraps `inner`
-    static Manager Wrap(const Manager& inner) {
-        Manager out;
-        out.values_.Wrap(inner.values_);
-        out.types = core::type::Manager::Wrap(inner.types);
-        return out;
-    }
 
     /// @param args the arguments used to construct the type, unique node or node.
     /// @return a pointer to an instance of `T` with the provided arguments.
@@ -133,6 +119,10 @@ class Manager final {
     const Scalar<u8>* Get(u8 value);
 
     /// @param value the constant value
+    /// @return a Scalar holding the u16 value @p value
+    const Scalar<u16>* Get(u16 value);
+
+    /// @param value the constant value
     /// @return a Scalar holding the f32 value @p value
     const Scalar<f32>* Get(f32 value);
 
@@ -151,6 +141,10 @@ class Manager final {
     /// @param value the constant value
     /// @return a Scalar holding the AInt value @p value
     const Scalar<AInt>* Get(AInt value);
+
+    /// @param value the string value
+    /// @return a String holding the value @p value
+    const String* Get(std::string_view value);
 
     /// Constructs a constant zero-value of the type @p type.
     /// @param type the constant type

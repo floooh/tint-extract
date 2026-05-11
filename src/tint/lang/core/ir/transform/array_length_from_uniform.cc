@@ -61,11 +61,39 @@ struct State {
     /// The uniform buffer variable that holds the total size of each storage buffer.
     Var* buffer_sizes_var = nullptr;
 
+    /// The construct instruction that creates the array lengths structure in the entry point.
+    Construct* lengths_constructor = nullptr;
+
     /// A map from an array function parameter to the function parameter that holds its length.
     Hashmap<FunctionParam*, FunctionParam*, 8> array_param_to_length_param{};
 
+    /// A map from a function to the structure that holds all of the array lengths.
+    Hashmap<Function*, Value*, 8> function_to_lengths_structure{};
+
+    /// A list of structure members for the array lengths structure.
+    Vector<type::Manager::StructMemberDesc, 8> lengths_structure_members{};
+
+    /// A map from a binding point to its index in the array length structure.
+    Hashmap<BindingPoint, uint32_t, 8> bindpoint_to_length_member_index{};
+
+    /// An ordered list of binding points that map to the structure members.
+    struct BindingPointInfo {
+        BindingPoint binding_point{};
+        const type::Type* store_type = nullptr;
+    };
+    Vector<BindingPointInfo, 8> ordered_bindpoints{};
+
+    /// A map from block to its containing function.
+    Hashmap<core::ir::Block*, core::ir::Function*, 64> block_to_function{};
+
     /// Process the module.
     void Process() {
+        // Seed the block-to-function map with the function entry blocks.
+        // This is used to determine the owning function for any given instruction.
+        for (auto& func : ir.functions) {
+            block_to_function.Add(func->Block(), func);
+        }
+
         // Look for and replace calls to the array length builtin.
         for (auto* inst : ir.Instructions()) {
             if (auto* call = inst->As<CoreBuiltinCall>()) {
@@ -74,6 +102,11 @@ struct State {
                 }
             }
         }
+
+        // Create the lengths structure and update all of the places that need to use it.
+        // We can only do this after we have replaced all of the array length callsites, now that we
+        // know all of the structure members that we need.
+        CreateLengthsStructure();
     }
 
     /// Replace a call to an array length builtin, if the variable appears in the bindpoint map.
@@ -111,11 +144,27 @@ struct State {
                     ptr = let->Value();
                     continue;
                 }
-                TINT_UNREACHABLE() << "unhandled source of a storage buffer pointer: "
-                                   << result->Instruction()->TypeInfo().name;
+                if (auto* construct = result->Instruction()->As<Construct>()) {
+                    // In the MSL backend, buffer_view can decompose into bundled parameters.
+                    TINT_IR_ASSERT(ir, construct->Operands()[0]->Type()->Is<type::Pointer>());
+                    ptr = construct->Operands()[0];
+                    continue;
+                }
+                if (auto* call = result->Instruction()->As<BuiltinCall>()) {
+                    // Various builtins return a pointer:
+                    // * bufferView
+                    // * bufferArrayView
+                    // * msl.pointer_offset
+                    if (call->Args()[0]->Type()->Is<type::Pointer>()) {
+                        ptr = call->Args()[0];
+                        continue;
+                    }
+                }
+                TINT_IR_UNREACHABLE(ir) << "unhandled source of a storage buffer pointer: "
+                                        << result->Instruction()->TypeInfo().name;
             }
-            TINT_UNREACHABLE() << "unhandled source of a storage buffer pointer: "
-                               << ptr->TypeInfo().name;
+            TINT_IR_UNREACHABLE(ir)
+                << "unhandled source of a storage buffer pointer: " << ptr->TypeInfo().name;
         }
     }
 
@@ -149,6 +198,38 @@ struct State {
         });
     }
 
+    /// Get (or create) the array lengths structure for a function.
+    /// @param func the function that needs the structure
+    /// @returns the array lengths structure
+    Value* GetArrayLengthsStructure(Function* func) {
+        return function_to_lengths_structure.GetOrAdd(func, [&]() -> Value* {
+            if (func->IsEntryPoint()) {
+                // Create a placeholder construct instruction for the lengths structure that will be
+                // filled in later when we know all of the structure members.
+                TINT_IR_ASSERT(ir, lengths_constructor == nullptr);
+                lengths_constructor = b.ConstructWithResult(ir.CreateValue<InstructionResult>());
+                lengths_constructor->InsertBefore(func->Block()->Front());
+                return lengths_constructor->Result();
+            }
+
+            // Add a new parameter to receive the array lengths structure.
+            // The type is a placeholder and will be filled in later when we create the struct type.
+            auto* lengths = b.FunctionParam("tint_array_lengths", nullptr);
+            func->AppendParam(lengths);
+
+            // Update callsites of this function to pass the structure to it.
+            func->ForEachUseUnsorted([&](core::ir::Usage use) {
+                if (auto* call = use.instruction->As<core::ir::UserCall>()) {
+                    // Get the structure in the calling function and pass that.
+                    auto* caller = ContainingFunction(call);
+                    call->AppendArg(GetArrayLengthsStructure(caller));
+                }
+            });
+
+            return lengths;
+        });
+    }
+
     /// Compute the array length of the runtime-sized array that is inside a storage buffer
     /// variable. If the variable's binding point is not found in the bindpoint map, returns nullptr
     /// to indicate that the original arrayLength builtin should be used instead.
@@ -158,7 +239,7 @@ struct State {
     /// @returns the length of the array, or nullptr if the original builtin should be used
     Value* ComputeArrayLength(Var* var, Instruction* insertion_point) {
         auto binding = var->BindingPoint();
-        TINT_ASSERT(binding);
+        TINT_IR_ASSERT(ir, binding);
 
         auto idx_it = bindpoint_to_size_index.find(*binding);
         if (idx_it == bindpoint_to_size_index.end()) {
@@ -167,37 +248,28 @@ struct State {
             return nullptr;
         }
 
-        Value* result = nullptr;
-        b.InsertBefore(insertion_point, [&] {
-            // Load the total storage buffer size from the uniform buffer.
-            // The sizes are packed into vec4s to satisfy the 16-byte alignment requirement for
-            // array elements in uniform buffers, so we have to find the vector and element that
-            // correspond to the index that we want.
-            const uint32_t size_index = idx_it->second;
-            const uint32_t array_index = size_index / 4;
-            const uint32_t vec_index = size_index % 4;
-            auto* vec_ptr = b.Access<ptr<uniform, vec4<u32>>>(BufferSizes(), u32(array_index));
-            auto* total_buffer_size = b.LoadVectorElement(vec_ptr, u32(vec_index))->Result();
-
-            // Calculate actual array length:
-            //                total_buffer_size - array_offset
-            // array_length = --------------------------------
-            //                             array_stride
-            auto* array_size = total_buffer_size;
-            auto* storage_buffer_type = var->Result()->Type()->UnwrapPtr();
-            const type::Array* array_type = nullptr;
-            if (auto* str = storage_buffer_type->As<core::type::Struct>()) {
-                // The variable is a struct, so subtract the byte offset of the array member.
-                auto* member = str->Members().Back();
-                array_type = member->Type()->As<core::type::Array>();
-                array_size = b.Subtract<u32>(total_buffer_size, u32(member->Offset()))->Result();
-            } else {
-                array_type = storage_buffer_type->As<core::type::Array>();
-            }
-            TINT_ASSERT(array_type);
-            result = b.Divide<u32>(array_size, u32(array_type->Stride()))->Result();
+        // Get the index of the structure member that holds the length for this binding point,
+        // creating the structure member descriptor if necessary.
+        auto member_index = bindpoint_to_length_member_index.GetOrAdd(*binding, [&]() {
+            auto index = static_cast<uint32_t>(lengths_structure_members.Length());
+            auto name = "tint_array_length_" + std::to_string(binding->group) + "_" +
+                        std::to_string(binding->binding);
+            lengths_structure_members.Push(type::Manager::StructMemberDesc{
+                .name = ir.symbols.Register(name),
+                .type = ty.u32(),
+            });
+            ordered_bindpoints.Push(BindingPointInfo{
+                .binding_point = *binding,
+                .store_type = var->Result()->Type()->UnwrapPtr(),
+            });
+            return index;
         });
-        return result;
+
+        // Extract the length from the structure.
+        auto* length = b.Access<u32>(GetArrayLengthsStructure(ContainingFunction(insertion_point)),
+                                     u32(member_index));
+        length->InsertBefore(insertion_point);
+        return length->Result();
     }
 
     /// Get (or create, on first call) the uniform buffer that contains the storage buffer sizes.
@@ -218,10 +290,86 @@ struct State {
         uint32_t num_elements = (max_index / 4) + 1;
         b.Append(ir.root_block, [&] {
             buffer_sizes_var = b.Var("tint_storage_buffer_sizes",
-                                     ty.ptr<uniform>(ty.array(ty.vec4<u32>(), num_elements)));
+                                     ty.ptr<uniform>(ty.array(ty.vec4u(), num_elements)));
         });
         buffer_sizes_var->SetBindingPoint(ubo_binding.group, ubo_binding.binding);
         return buffer_sizes_var->Result();
+    }
+
+    /// Create the structure to hold the array lengths and fill in the construct instruction that
+    /// sets all of the length values.
+    void CreateLengthsStructure() {
+        if (lengths_structure_members.IsEmpty()) {
+            return;
+        }
+
+        // Create the lengths structure.
+        auto* lengths_struct = ty.Struct(ir.symbols.New("tint_array_lengths_struct"),
+                                         std::move(lengths_structure_members));
+
+        // Update all of the function parameters that need to receive the lengths structure.
+        for (auto s : function_to_lengths_structure) {
+            if (auto* param = s.value->As<FunctionParam>()) {
+                param->SetType(lengths_struct);
+            }
+        }
+
+        // Insert code at the beginning of the entry point to initialize the array length members.
+        if (lengths_constructor == nullptr) {
+            return;
+        }
+        lengths_constructor->Result()->SetType(lengths_struct);
+        b.InsertBefore(lengths_constructor->Block()->Front(), [&] {
+            Vector<Value*, 8> constructor_values;
+            for (auto info : ordered_bindpoints) {
+                TINT_IR_ASSERT(ir, bindpoint_to_size_index.contains(info.binding_point));
+                TINT_IR_ASSERT(ir, bindpoint_to_length_member_index.Contains(info.binding_point));
+
+                // Load the total storage buffer size from the uniform buffer.
+                // The sizes are packed into vec4s to satisfy the 16-byte alignment requirement for
+                // array elements in uniform buffers, so we have to find the vector and element that
+                // correspond to the index that we want.
+                const uint32_t size_index = bindpoint_to_size_index.at(info.binding_point);
+                const uint32_t array_index = size_index / 4;
+                const uint32_t vec_index = size_index % 4;
+                auto* vec_ptr = b.Access<ptr<uniform, vec4u>>(BufferSizes(), u32(array_index));
+                auto* total_buffer_size = b.LoadVectorElement(vec_ptr, u32(vec_index))->Result();
+
+                // Calculate actual array length:
+                //                total_buffer_size - array_offset
+                // array_length = --------------------------------
+                //                             array_stride
+                auto* array_size = total_buffer_size;
+                uint32_t array_stride = 0;
+                if (auto* str = info.store_type->As<core::type::Struct>()) {
+                    // The variable is a struct, so subtract the byte offset of the array member.
+                    auto* member = str->Members().Back();
+                    auto* array_type = member->Type()->As<core::type::Array>();
+                    array_size = b.Subtract(total_buffer_size, u32(member->Offset()))->Result();
+                    array_stride = array_type->ImplicitStride();
+                } else if (info.store_type->Is<core::type::Buffer>()) {
+                    array_stride = 1;
+                } else {
+                    array_stride = info.store_type->As<core::type::Array>()->ImplicitStride();
+                }
+
+                auto* length = array_size;
+                if (array_stride != 1) {
+                    length = b.Divide(array_size, u32(array_stride))->Result();
+                }
+                constructor_values.Push(length);
+            }
+            lengths_constructor->SetOperands(std::move(constructor_values));
+        });
+    }
+
+    /// Get the function that contains an instruction.
+    /// @param inst the instruction
+    /// @returns the function
+    core::ir::Function* ContainingFunction(core::ir::Instruction* inst) {
+        return block_to_function.GetOrAdd(inst->Block(), [&] {  //
+            return ContainingFunction(inst->Block()->Parent());
+        });
     }
 
     /// @returns true if the transformed module needs a storage buffer sizes UBO
@@ -234,10 +382,8 @@ Result<ArrayLengthFromUniformResult> ArrayLengthFromUniform(
     Module& ir,
     BindingPoint ubo_binding,
     const std::unordered_map<BindingPoint, uint32_t>& bindpoint_to_size_index) {
-    auto validated = ValidateAndDumpIfNeeded(ir, "core.ArrayLengthFromUniform");
-    if (validated != Success) {
-        return validated.Failure();
-    }
+    core::ir::AssertValid(ir, kArrayLengthFromUniformCapabilities,
+                          "before core.ArrayLengthFromUniform");
 
     State state{ir, ubo_binding, bindpoint_to_size_index};
     state.Process();

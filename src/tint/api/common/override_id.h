@@ -29,10 +29,11 @@
 #define SRC_TINT_API_COMMON_OVERRIDE_ID_H_
 
 #include <stdint.h>
+
 #include <functional>
 
 #include "src/tint/utils/math/hash.h"
-#include "src/tint/utils/reflection.h"
+#include "src/tint/utils/reflection/reflection.h"
 
 namespace tint {
 

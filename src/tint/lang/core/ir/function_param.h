@@ -31,7 +31,7 @@
 #include <utility>
 
 #include "src/tint/api/common/binding_point.h"
-#include "src/tint/lang/core/builtin_value.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/io_attributes.h"
 #include "src/tint/lang/core/ir/value.h"
 #include "src/tint/utils/containers/vector.h"
@@ -70,19 +70,16 @@ class FunctionParam : public Castable<FunctionParam, Value> {
     /// @returns the index of the parameter in the function's parameter list
     uint32_t Index() const { return index_; }
 
-    /// @returns the type of the var
-    const core::type::Type* Type() const override { return type_; }
-
-    /// Sets the type of the parameter to @p type
-    /// @param type the new type of the parameter
-    void SetType(const core::type::Type* type) { type_ = type; }
-
     /// @copydoc Value::Clone()
     FunctionParam* Clone(CloneContext& ctx) override;
 
     /// Sets the IO attributes.
     /// @param attrs the attributes
     void SetAttributes(const IOAttributes& attrs) { attributes_ = attrs; }
+
+    /// Resets the function attributes
+    void ResetAttributes() { attributes_ = {}; }
+
     /// @returns the IO attributes
     const IOAttributes& Attributes() const { return attributes_; }
 
@@ -128,22 +125,22 @@ class FunctionParam : public Castable<FunctionParam, Value> {
     /// Sets the binding point
     /// @param group the group
     /// @param binding the binding
-    void SetBindingPoint(uint32_t group, uint32_t binding) { binding_point_ = {group, binding}; }
+    void SetBindingPoint(uint32_t group, uint32_t binding) {
+        attributes_.binding_point = {group, binding};
+    }
 
     /// Sets the binding point
     /// @param binding_point the binding point
     void SetBindingPoint(std::optional<struct BindingPoint> binding_point) {
-        binding_point_ = binding_point;
+        attributes_.binding_point = binding_point;
     }
 
     /// @returns the binding points if `Attributes` contains `kBindingPoint`
-    std::optional<struct BindingPoint> BindingPoint() const { return binding_point_; }
+    std::optional<struct BindingPoint> BindingPoint() const { return attributes_.binding_point; }
 
   private:
     ir::Function* func_ = nullptr;
     uint32_t index_ = 0xffffffff;
-    const core::type::Type* type_ = nullptr;
-    std::optional<struct BindingPoint> binding_point_;
     IOAttributes attributes_;
 };
 

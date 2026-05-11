@@ -63,7 +63,7 @@ void GlobalVariable::AddTransitivelyReferencedOverride(const GlobalVariable* var
 }
 
 Parameter::Parameter(const ast::Parameter* declaration,
-                     uint32_t index /* = 0 */,
+                     uint32_t index,
                      const core::type::Type* type /* = nullptr */,
                      core::ParameterUsage usage /* = core::ParameterUsage::kNone */)
     : Base(declaration), index_(index), usage_(usage) {
@@ -77,13 +77,7 @@ VariableUser::VariableUser(const ast::IdentifierExpression* declaration,
                            Statement* statement,
                            const core::constant::Value* constant,
                            sem::Variable* variable)
-    : Base(declaration,
-           variable->Type(),
-           stage,
-           statement,
-           constant,
-           /* has_side_effects */ false),
-      variable_(variable) {
+    : Base(declaration, variable->Type(), stage, statement, constant), variable_(variable) {
     auto* type = variable->Type();
     if (type->Is<core::type::Pointer>() && variable->Initializer()) {
         root_identifier_ = variable->Initializer()->RootIdentifier();

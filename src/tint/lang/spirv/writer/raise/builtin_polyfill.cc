@@ -28,25 +28,35 @@
 #include "src/tint/lang/spirv/writer/raise/builtin_polyfill.h"
 
 #include <utility>
+#include <vector>
 
 #include "spirv/unified1/spirv.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/fluent_types.h"
 #include "src/tint/lang/core/ir/builder.h"
+#include "src/tint/lang/core/ir/core_builtin_call.h"
+#include "src/tint/lang/core/ir/instruction.h"
 #include "src/tint/lang/core/ir/module.h"
 #include "src/tint/lang/core/ir/validator.h"
+#include "src/tint/lang/core/ir/value.h"
+#include "src/tint/lang/core/type/binding_array.h"
 #include "src/tint/lang/core/type/builtin_structs.h"
 #include "src/tint/lang/core/type/depth_multisampled_texture.h"
 #include "src/tint/lang/core/type/depth_texture.h"
+#include "src/tint/lang/core/type/i8.h"
 #include "src/tint/lang/core/type/input_attachment.h"
 #include "src/tint/lang/core/type/multisampled_texture.h"
+#include "src/tint/lang/core/type/resource_table.h"
 #include "src/tint/lang/core/type/sampled_texture.h"
 #include "src/tint/lang/core/type/storage_texture.h"
 #include "src/tint/lang/core/type/texture.h"
+#include "src/tint/lang/core/type/u8.h"
+#include "src/tint/lang/spirv/ir/binary.h"
 #include "src/tint/lang/spirv/ir/builtin_call.h"
-#include "src/tint/lang/spirv/ir/image_from_texture.h"
-#include "src/tint/lang/spirv/ir/literal_operand.h"
+#include "src/tint/lang/spirv/type/literal.h"
 #include "src/tint/lang/spirv/type/sampled_image.h"
 #include "src/tint/utils/ice/ice.h"
+#include "src/tint/utils/internal_limits.h"
 
 using namespace tint::core::number_suffixes;  // NOLINT
 using namespace tint::core::fluent_types;     // NOLINT
@@ -55,13 +65,118 @@ namespace tint::spirv::writer::raise {
 
 namespace {
 
+const spirv::type::Image* ImageFromTexture(core::type::Manager& ty,
+                                           const core::type::Texture* tex_ty) {
+    auto dim = type::Dim::kD1;
+    auto depth = type::Depth::kNotDepth;
+    auto arrayed = type::Arrayed::kNonArrayed;
+    auto ms = type::Multisampled::kSingleSampled;
+    auto sampled = type::Sampled::kSamplingCompatible;
+    auto fmt = core::TexelFormat::kUndefined;
+    auto access = core::Access::kReadWrite;
+    const core::type::Type* sample_ty = ty.f32();
+
+    switch (tex_ty->Dim()) {
+        case core::type::TextureDimension::k1d:
+            dim = type::Dim::kD1;
+            break;
+        case core::type::TextureDimension::k2d:
+            dim = type::Dim::kD2;
+            break;
+        case core::type::TextureDimension::k2dArray:
+            dim = type::Dim::kD2;
+            arrayed = type::Arrayed::kArrayed;
+            break;
+        case core::type::TextureDimension::k3d:
+            dim = type::Dim::kD3;
+            break;
+        case core::type::TextureDimension::kCube:
+            dim = type::Dim::kCube;
+            break;
+        case core::type::TextureDimension::kCubeArray:
+            dim = type::Dim::kCube;
+            arrayed = type::Arrayed::kArrayed;
+            break;
+        default:
+            TINT_ICE() << "Invalid texture dimension: " << tex_ty->Dim();
+    }
+
+    tint::Switch(
+        tex_ty,                                 //
+        [&](const core::type::DepthTexture*) {  //
+            depth = type::Depth::kDepth;
+        },
+        [&](const core::type::DepthMultisampledTexture*) {
+            depth = type::Depth::kDepth;
+            ms = type::Multisampled::kMultisampled;
+        },
+        [&](const core::type::MultisampledTexture* mt) {
+            ms = type::Multisampled::kMultisampled;
+            sample_ty = mt->Type();
+        },
+        [&](const core::type::SampledTexture* st) {
+            sampled = type::Sampled::kSamplingCompatible;
+            sample_ty = st->Type();
+        },
+        [&](const core::type::StorageTexture* st) {
+            sampled = type::Sampled::kReadWriteOpCompatible;
+            fmt = st->TexelFormat();
+            sample_ty = st->Type();
+            access = st->Access();
+        },
+        [&](const core::type::TexelBuffer* tb) {
+            sampled = type::Sampled::kReadWriteOpCompatible;
+            fmt = tb->TexelFormat();
+            sample_ty = tb->Type();
+            access = tb->Access();
+            dim = type::Dim::kBuffer;
+        },
+        [&](const core::type::InputAttachment* ia) {
+            dim = type::Dim::kSubpassData;
+            sampled = type::Sampled::kReadWriteOpCompatible;
+            sample_ty = ia->Type();
+        },
+        TINT_ICE_ON_NO_MATCH);
+
+    return ty.Get<type::Image>(sample_ty, dim, depth, arrayed, ms, sampled, fmt, access);
+}
+
+/// Returns a replacement type if type replacement is necessary.
+/// @param ty the type manager
+/// @param type the type to replace
+/// @returns the replacement type if replacement needs to happen
+const core::type::Type* ReplacementType(core::type::Manager& ty, const core::type::Type* type) {
+    return Switch(
+        type,
+        [&](const core::type::Pointer* ptr) -> const core::type::Type* {
+            if (auto* replacement = ReplacementType(ty, ptr->StoreType())) {
+                return ty.ptr(ptr->AddressSpace(), replacement, ptr->Access());
+            }
+            return nullptr;
+        },
+        [&](const core::type::BindingArray* arr) -> const core::type::Type* {
+            if (auto* replacement = ReplacementType(ty, arr->ElemType())) {
+                return ty.binding_array(replacement,
+                                        arr->Count()->As<core::type::ConstantArrayCount>()->value);
+            }
+            return nullptr;
+        },
+        [&](const core::type::ResourceTable* rb) -> const core::type::Type* {
+            if (auto* replacement = ReplacementType(ty, rb->GetBindingType())) {
+                return ty.Get<core::type::ResourceTable>(replacement);
+            }
+            return nullptr;
+        },
+        [&](const core::type::Texture* tex) { return ImageFromTexture(ty, tex); },
+        [&](Default) { return nullptr; });
+}
+
 /// PIMPL state for the transform.
 struct State {
     /// The IR module.
     core::ir::Module& ir;
 
-    /// If we should use the vulkan memory model
-    bool use_vulkan_memory_model = false;
+    PolyfillConfig config;
 
     /// The IR builder.
     core::ir::Builder b{ir};
@@ -72,36 +187,33 @@ struct State {
     /// Process the module.
     void Process() {
         // Find the builtins that need replacing.
-        Vector<core::ir::CoreBuiltinCall*, 4> worklist;
+        Vector<core::ir::Construct*, 4> subgroup_matrix_constructors;
 
-        // Convert function parameters to `spirv::type::Image` if necessary
+        // Replace types for function parameters if necessary
         for (auto fn : ir.functions) {
             for (auto* param : fn->Params()) {
-                if (auto* tex = param->Type()->As<core::type::Texture>()) {
-                    param->SetType(ir::ImageFromTexture(ty, tex));
+                if (auto* replacement = ReplacementType(ty, param->Type())) {
+                    param->SetType(replacement);
                 }
             }
         }
 
+        std::vector<std::function<void()>> worklist;
+        worklist.reserve(128);
+
         for (auto* inst : ir.Instructions()) {
-            // Convert instruction results to `spirv::type::Image` if necessary
-            if (!inst->Results().IsEmpty()) {
-                if (auto* res = inst->Result(0)->As<core::ir::InstructionResult>()) {
-                    // Watch for pointers, which would be wrapping any texture on a `var`
-                    if (auto* tex = res->Type()->UnwrapPtr()->As<core::type::Texture>()) {
-                        auto* tex_ty = ir::ImageFromTexture(ty, tex);
-                        const core::type::Type* res_ty = tex_ty;
-                        if (auto* orig_ptr = res->Type()->As<core::type::Pointer>()) {
-                            res_ty = ty.ptr(orig_ptr->AddressSpace(), res_ty, orig_ptr->Access());
-                        }
-                        res->SetType(res_ty);
-                    }
+            // Replace types for instruction results if necessary
+            for (auto* result : inst->Results()) {
+                if (auto* replacement = ReplacementType(ty, result->Type())) {
+                    result->SetType(replacement);
                 }
             }
 
             if (auto* builtin = inst->As<core::ir::CoreBuiltinCall>()) {
                 switch (builtin->Func()) {
                     case core::BuiltinFn::kArrayLength:
+                        worklist.push_back([this, builtin] { ArrayLength(builtin); });
+                        break;
                     case core::BuiltinFn::kAtomicAdd:
                     case core::BuiltinFn::kAtomicAnd:
                     case core::BuiltinFn::kAtomicCompareExchangeWeak:
@@ -113,142 +225,150 @@ struct State {
                     case core::BuiltinFn::kAtomicStore:
                     case core::BuiltinFn::kAtomicSub:
                     case core::BuiltinFn::kAtomicXor:
+                    case core::BuiltinFn::kAtomicStoreMax:
+                    case core::BuiltinFn::kAtomicStoreMin:
+                        worklist.push_back([this, builtin] { Atomic(builtin); });
+                        break;
                     case core::BuiltinFn::kDot:
+                        worklist.push_back([this, builtin] { Dot(builtin); });
+                        break;
                     case core::BuiltinFn::kDot4I8Packed:
                     case core::BuiltinFn::kDot4U8Packed:
+                        worklist.push_back([this, builtin] { DotPacked4x8(builtin); });
+                        break;
                     case core::BuiltinFn::kQuadBroadcast:
+                        worklist.push_back([this, builtin] { QuadBroadcast(builtin); });
+                        break;
                     case core::BuiltinFn::kSelect:
+                        worklist.push_back([this, builtin] { Select(builtin); });
+                        break;
                     case core::BuiltinFn::kSubgroupBroadcast:
+                        worklist.push_back([this, builtin] { SubgroupBroadcast(builtin); });
+                        break;
                     case core::BuiltinFn::kSubgroupShuffle:
+                    case core::BuiltinFn::kSubgroupShuffleDown:
+                    case core::BuiltinFn::kSubgroupShuffleUp:
+                    case core::BuiltinFn::kSubgroupShuffleXor: {
+                        bool clamped = config.subgroup_shuffle_clamped;
+                        worklist.push_back(
+                            [this, builtin, clamped] { SubgroupShuffle(builtin, clamped); });
+                        break;
+                    }
                     case core::BuiltinFn::kTextureDimensions:
+                        worklist.push_back([this, builtin] { TextureDimensions(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureGather:
                     case core::BuiltinFn::kTextureGatherCompare:
+                        worklist.push_back([this, builtin] { TextureGather(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureLoad:
+                        worklist.push_back([this, builtin] { TextureLoad(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureNumLayers:
+                        worklist.push_back([this, builtin] { TextureNumLayers(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureNumLevels:
+                        worklist.push_back([this, builtin] { TextureNumLevels(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureNumSamples:
+                        worklist.push_back([this, builtin] { TextureNumSamples(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureSample:
                     case core::BuiltinFn::kTextureSampleBias:
                     case core::BuiltinFn::kTextureSampleCompare:
                     case core::BuiltinFn::kTextureSampleCompareLevel:
                     case core::BuiltinFn::kTextureSampleGrad:
                     case core::BuiltinFn::kTextureSampleLevel:
+                        worklist.push_back([this, builtin] { TextureSample(builtin); });
+                        break;
                     case core::BuiltinFn::kTextureStore:
-                    case core::BuiltinFn::kInputAttachmentLoad:
-                    case core::BuiltinFn::kSubgroupMatrixLoad:
-                    case core::BuiltinFn::kSubgroupMatrixStore:
-                    case core::BuiltinFn::kSubgroupMatrixMultiply:
-                    case core::BuiltinFn::kSubgroupMatrixMultiplyAccumulate:
-                        worklist.Push(builtin);
+                        worklist.push_back([this, builtin] { TextureStore(builtin); });
                         break;
                     case core::BuiltinFn::kQuantizeToF16:
                         if (builtin->Result()->Type()->Is<core::type::Vector>()) {
-                            worklist.Push(builtin);
+                            worklist.push_back([this, builtin] { QuantizeToF16Vec(builtin); });
                         }
+                        break;
+                    case core::BuiltinFn::kInputAttachmentLoad:
+                        worklist.push_back([this, builtin] { InputAttachmentLoad(builtin); });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixLoad:
+                        worklist.push_back([this, builtin] { SubgroupMatrixLoad(builtin); });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixStore:
+                        worklist.push_back([this, builtin] { SubgroupMatrixStore(builtin); });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixMultiply:
+                        worklist.push_back([this, builtin] { SubgroupMatrixMultiply(builtin); });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixMultiplyAccumulate:
+                        worklist.push_back(
+                            [this, builtin] { SubgroupMatrixMultiplyAccumulate(builtin); });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixScalarAdd:
+                        worklist.push_back([this, builtin] {
+                            SubgroupMatrixScalar(builtin, core::BinaryOp::kAdd);
+                        });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixScalarSubtract:
+                        worklist.push_back([this, builtin] {
+                            SubgroupMatrixScalar(builtin, core::BinaryOp::kSubtract);
+                        });
+                        break;
+                    case core::BuiltinFn::kSubgroupMatrixScalarMultiply:
+                        worklist.push_back([this, builtin] {
+                            SubgroupMatrixScalar(builtin, core::BinaryOp::kMultiply);
+                        });
                         break;
                     default:
                         break;
                 }
             }
+            if (auto* construct = inst->As<core::ir::Construct>()) {
+                if (auto* sm = construct->Result()->Type()->As<core::type::SubgroupMatrix>()) {
+                    if (sm->Type()->IsAnyOf<core::type::I8, core::type::U8>() &&
+                        construct->Args().size() > 0) {
+                        subgroup_matrix_constructors.Push(construct);
+                    }
+                }
+            }
         }
 
         // Replace the builtins that we found.
-        for (auto* builtin : worklist) {
-            switch (builtin->Func()) {
-                case core::BuiltinFn::kArrayLength:
-                    ArrayLength(builtin);
-                    break;
-                case core::BuiltinFn::kAtomicAdd:
-                case core::BuiltinFn::kAtomicAnd:
-                case core::BuiltinFn::kAtomicCompareExchangeWeak:
-                case core::BuiltinFn::kAtomicExchange:
-                case core::BuiltinFn::kAtomicLoad:
-                case core::BuiltinFn::kAtomicMax:
-                case core::BuiltinFn::kAtomicMin:
-                case core::BuiltinFn::kAtomicOr:
-                case core::BuiltinFn::kAtomicStore:
-                case core::BuiltinFn::kAtomicSub:
-                case core::BuiltinFn::kAtomicXor:
-                    Atomic(builtin);
-                    break;
-                case core::BuiltinFn::kDot:
-                    Dot(builtin);
-                    break;
-                case core::BuiltinFn::kDot4I8Packed:
-                case core::BuiltinFn::kDot4U8Packed:
-                    DotPacked4x8(builtin);
-                    break;
-                case core::BuiltinFn::kQuadBroadcast:
-                    QuadBroadcast(builtin);
-                    break;
-                case core::BuiltinFn::kSelect:
-                    Select(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupBroadcast:
-                    SubgroupBroadcast(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupShuffle:
-                    SubgroupShuffle(builtin);
-                    break;
-                case core::BuiltinFn::kTextureDimensions:
-                    TextureDimensions(builtin);
-                    break;
-                case core::BuiltinFn::kTextureGather:
-                case core::BuiltinFn::kTextureGatherCompare:
-                    TextureGather(builtin);
-                    break;
-                case core::BuiltinFn::kTextureLoad:
-                    TextureLoad(builtin);
-                    break;
-                case core::BuiltinFn::kTextureNumLayers:
-                    TextureNumLayers(builtin);
-                    break;
-                case core::BuiltinFn::kTextureNumLevels:
-                    TextureNumLevels(builtin);
-                    break;
-                case core::BuiltinFn::kTextureNumSamples:
-                    TextureNumSamples(builtin);
-                    break;
-                case core::BuiltinFn::kTextureSample:
-                case core::BuiltinFn::kTextureSampleBias:
-                case core::BuiltinFn::kTextureSampleCompare:
-                case core::BuiltinFn::kTextureSampleCompareLevel:
-                case core::BuiltinFn::kTextureSampleGrad:
-                case core::BuiltinFn::kTextureSampleLevel:
-                    TextureSample(builtin);
-                    break;
-                case core::BuiltinFn::kTextureStore:
-                    TextureStore(builtin);
-                    break;
-                case core::BuiltinFn::kQuantizeToF16:
-                    QuantizeToF16Vec(builtin);
-                    break;
-                case core::BuiltinFn::kInputAttachmentLoad:
-                    InputAttachmentLoad(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupMatrixLoad:
-                    SubgroupMatrixLoad(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupMatrixStore:
-                    SubgroupMatrixStore(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupMatrixMultiply:
-                    SubgroupMatrixMultiply(builtin);
-                    break;
-                case core::BuiltinFn::kSubgroupMatrixMultiplyAccumulate:
-                    SubgroupMatrixMultiplyAccumulate(builtin);
-                    break;
-                default:
-                    break;
-            }
+        for (auto& cb : worklist) {
+            cb();
+        }
+
+        // Replace non-zero subgroup matrix constructors that use 8-bit component types.
+        // SPIR-V requires that the value passed to OpCompositeConstruct is an 8-bit value.
+        for (auto* construct : subgroup_matrix_constructors) {
+            auto* sm_ty = construct->Result()->Type()->As<core::type::SubgroupMatrix>();
+            TINT_IR_ASSERT(ir, construct->Args().size() == 1u);
+            TINT_IR_ASSERT(ir, sm_ty);
+            auto* value = construct->Args()[0];
+            b.InsertBefore(construct, [&] {
+                if (sm_ty->Type()->Is<core::type::I8>()) {
+                    value = b.CallExplicit<spirv::ir::BuiltinCall>(
+                                 ty.i8(), spirv::BuiltinFn::kSConvert, Vector{ty.i8()},
+                                 b.Clamp(value, -128_i, 127_i))
+                                ->Result();
+                } else if (sm_ty->Type()->Is<core::type::U8>()) {
+                    value = b.CallExplicit<spirv::ir::BuiltinCall>(
+                                 ty.u8(), spirv::BuiltinFn::kUConvert, Vector{ty.u8()},
+                                 b.Clamp(value, 0_u, 255_u))
+                                ->Result();
+                }
+            });
+            construct->SetArg(0, value);
         }
     }
 
     /// Create a literal operand.
     /// @param value the literal value
     /// @returns the literal operand
-    spirv::ir::LiteralOperand* Literal(u32 value) {
-        return ir.CreateValue<spirv::ir::LiteralOperand>(b.ConstantValue(value));
+    core::ir::Value* Literal(u32 value) {
+        return b.Constant(
+            ir.constant_values.Get<core::constant::Scalar<u32>>(ty.Get<type::Literal>(), value));
     }
 
     /// Handle an `arrayLength()` builtin.
@@ -259,12 +379,12 @@ struct State {
         while (auto* let = tint::As<core::ir::Let>(ptr->Instruction())) {
             ptr = let->Value()->As<core::ir::InstructionResult>();
         }
-        TINT_ASSERT(ptr);
+        TINT_IR_ASSERT(ir, ptr);
 
         auto* access = ptr->Instruction()->As<core::ir::Access>();
-        TINT_ASSERT(access);
-        TINT_ASSERT(access->Indices().Length() == 1u);
-        TINT_ASSERT(access->Object()->Type()->UnwrapPtr()->Is<core::type::Struct>());
+        TINT_IR_ASSERT(ir, access);
+        TINT_IR_ASSERT(ir, access->Indices().size() == 1u);
+        TINT_IR_ASSERT(ir, access->Object()->Type()->UnwrapPtr()->Is<core::type::Struct>());
         auto* const_idx = access->Indices()[0]->As<core::ir::Constant>();
 
         // Replace the builtin call with a call to the spirv.array_length intrinsic.
@@ -288,7 +408,7 @@ struct State {
                 case core::AddressSpace::kStorage:
                     return b.Constant(u32(SpvScopeDevice));
                 default:
-                    TINT_UNREACHABLE() << "unhandled atomic address space";
+                    TINT_IR_UNREACHABLE(ir) << "unhandled atomic address space";
             }
         }();
         auto* memory_semantics = b.Constant(u32(SpvMemorySemanticsMaskNone));
@@ -324,7 +444,7 @@ struct State {
 
                 // Compare the original value to the comparator to see if an exchange happened.
                 auto* original = call->Result();
-                auto* compare = b.Equal(ty.bool_(), original, cmp);
+                auto* compare = b.Equal(original, cmp);
                 compare->InsertBefore(builtin);
 
                 // Construct the atomicCompareExchange result structure.
@@ -359,6 +479,17 @@ struct State {
                 }
                 call->AppendArg(builtin->Args()[1]);
                 break;
+            case core::BuiltinFn::kAtomicStoreMax: {
+                call = build(spirv::BuiltinFn::kAtomicUMax);
+                call->AppendArg(builtin->Args()[1]);
+                call->Result()->SetType(ty.u64());
+                break;
+            }
+            case core::BuiltinFn::kAtomicStoreMin:
+                call = build(spirv::BuiltinFn::kAtomicUMin);
+                call->AppendArg(builtin->Args()[1]);
+                call->Result()->SetType(ty.u64());
+                break;
             case core::BuiltinFn::kAtomicStore:
                 call = build(spirv::BuiltinFn::kAtomicStore);
                 call->AppendArg(builtin->Args()[1]);
@@ -372,7 +503,7 @@ struct State {
                 call->AppendArg(builtin->Args()[1]);
                 break;
             default:
-                TINT_UNREACHABLE() << "unhandled atomic builtin";
+                TINT_IR_UNREACHABLE(ir) << "unhandled atomic builtin";
         }
 
         call->InsertBefore(builtin);
@@ -395,9 +526,9 @@ struct State {
                 b.InsertBefore(builtin, [&] {
                     auto* e1 = b.Access(elty, v1, u32(i));
                     auto* e2 = b.Access(elty, v2, u32(i));
-                    auto* mul = b.Multiply(elty, e1, e2);
+                    auto* mul = b.Multiply(e1, e2);
                     if (sum) {
-                        sum = b.Add(elty, sum, mul);
+                        sum = b.Add(sum, mul);
                     } else {
                         sum = mul;
                     }
@@ -442,17 +573,19 @@ struct State {
             builtin->Args()[0],
         };
 
-        // If the condition is scalar and the objects are vectors, we need to splat the condition
-        // into a vector of the same size.
-        // TODO(jrprice): We don't need to do this if we're targeting SPIR-V 1.4 or newer.
-        auto* vec = builtin->Result()->Type()->As<core::type::Vector>();
-        if (vec && args[0]->Type()->Is<core::type::Scalar>()) {
-            Vector<core::ir::Value*, 4> elements;
-            elements.Resize(vec->Width(), args[0]);
+        if (config.version < SpvVersion::kSpv14) {
+            // If the condition is scalar and the objects are vectors, we need to splat the
+            // condition into a vector of the same size.
+            auto* vec = builtin->Result()->Type()->As<core::type::Vector>();
+            if (vec && args[0]->Type()->Is<core::type::Scalar>()) {
+                Vector<core::ir::Value*, 4> elements;
+                elements.Resize(vec->Width(), args[0]);
 
-            auto* construct = b.Construct(ty.vec(ty.bool_(), vec->Width()), std::move(elements));
-            construct->InsertBefore(builtin);
-            args[0] = construct->Result();
+                auto* construct =
+                    b.Construct(ty.vec(ty.bool_(), vec->Width()), std::move(elements));
+                construct->InsertBefore(builtin);
+                args[0] = construct->Result();
+            }
         }
 
         // Replace the builtin call with a call to the spirv.select intrinsic.
@@ -494,7 +627,7 @@ struct State {
         args.Push(nullptr);
 
         // Append the NonPrivateTexel flag to Read/Write storage textures when we load/store them.
-        if (use_vulkan_memory_model) {
+        if (config.use_vulkan_memory_model) {
             if (insertion_point->Func() == core::BuiltinFn::kTextureLoad ||
                 insertion_point->Func() == core::BuiltinFn::kTextureStore) {
                 if (auto* st = insertion_point->Args()[0]->Type()->As<spirv::type::Image>()) {
@@ -570,7 +703,7 @@ struct State {
         // Helper to get the next argument from the call, or nullptr if there are no more arguments.
         uint32_t arg_idx = 0;
         auto next_arg = [&]() {
-            return arg_idx < builtin->Args().Length() ? builtin->Args()[arg_idx++] : nullptr;
+            return arg_idx < builtin->Args().size() ? builtin->Args()[arg_idx++] : nullptr;
         };
 
         auto* texture = next_arg();
@@ -578,18 +711,32 @@ struct State {
         auto* coords = next_arg();
         auto* texture_ty = texture->Type()->As<spirv::type::Image>();
 
+        const bool is_depth_3d_cube_array = texture_ty->GetArrayed() == type::Arrayed::kArrayed &&
+                                            texture_ty->GetDepth() == type::Depth::kDepth &&
+                                            texture_ty->GetDim() == type::Dim::kCube;
+        const bool polyfill_depth_cube_array =
+            config.texture_sample_compare_depth_cube_array && is_depth_3d_cube_array &&
+            (builtin->Func() == core::BuiltinFn::kTextureSampleCompare ||
+             builtin->Func() == core::BuiltinFn::kTextureSampleCompareLevel);
+
+        // This includes both 2d and 2d array.
+        const bool is_depth_2d = (texture_ty->GetDim() == type::Dim::kD2) &&
+                                 (texture_ty->GetDepth() == type::Depth::kDepth);
+
+        const bool polyfill_depth_2d =
+            config.texture_sample_compare_2d_polyfill && is_depth_2d &&
+            (builtin->Func() == core::BuiltinFn::kTextureSampleCompare ||
+             builtin->Func() == core::BuiltinFn::kTextureSampleCompareLevel);
+
         // Use OpSampledImage to create an OpTypeSampledImage object.
         auto* sampled_image = b.CallExplicit<spirv::ir::BuiltinCall>(
-            ty.Get<type::SampledImage>(texture_ty), spirv::BuiltinFn::kSampledImage,
+            ty.Get<type::SampledImage>(texture_ty), spirv::BuiltinFn::kOpSampledImage,
             Vector{texture_ty}, Vector{texture, sampler});
         sampled_image->InsertBefore(builtin);
 
         // Append the array index to the coordinates if provided.
         auto* array_idx =
             texture_ty->GetArrayed() == type::Arrayed::kArrayed ? next_arg() : nullptr;
-        if (array_idx) {
-            coords = AppendArrayIndex(coords, array_idx, builtin);
-        }
 
         // Determine which SPIR-V function to use and which optional image operands are needed.
         enum spirv::BuiltinFn function = BuiltinFn::kNone;
@@ -606,14 +753,20 @@ struct State {
                 operands.offset = next_arg();
                 break;
             case core::BuiltinFn::kTextureSampleCompare:
-                function = spirv::BuiltinFn::kImageSampleDrefImplicitLod;
+                function = (polyfill_depth_cube_array || polyfill_depth_2d)
+                               ? spirv::BuiltinFn::kImageDrefGather
+                               : spirv::BuiltinFn::kImageSampleDrefImplicitLod;
                 depth = next_arg();
                 operands.offset = next_arg();
                 break;
             case core::BuiltinFn::kTextureSampleCompareLevel:
-                function = spirv::BuiltinFn::kImageSampleDrefExplicitLod;
+                function = (polyfill_depth_cube_array || polyfill_depth_2d)
+                               ? spirv::BuiltinFn::kImageDrefGather
+                               : spirv::BuiltinFn::kImageSampleDrefExplicitLod;
                 depth = next_arg();
-                operands.lod = b.Constant(0_f);
+                if (!polyfill_depth_cube_array && !polyfill_depth_2d) {
+                    operands.lod = b.Constant(0_f);
+                }
                 operands.offset = next_arg();
                 break;
             case core::BuiltinFn::kTextureSampleGrad:
@@ -628,7 +781,47 @@ struct State {
                 operands.offset = next_arg();
                 break;
             default:
-                TINT_UNREACHABLE() << "unhandled texture sample builtin";
+                TINT_IR_UNREACHABLE(ir) << "unhandled texture sample builtin";
+        }
+
+        core::ir::Value* fract_bilinear = nullptr;
+        if (polyfill_depth_2d) {
+            b.InsertBefore(builtin, [&] {
+                // Get texture dimensions. The return type depends on if it was an array texture.
+                auto* dim = b.CallExplicit<spirv::ir::BuiltinCall>(
+                    array_idx ? ty.vec3u() : ty.vec2u(), spirv::BuiltinFn::kImageQuerySizeLod,
+                    Vector{ty.u32()}, texture, b.Constant(0_i));
+
+                auto* dim2u = b.Swizzle(ty.vec2u(), dim, {0, 1});
+                auto* fdim = b.Convert(ty.vec2f(), dim2u);
+
+                // Calculate texel position: coords * dim - 0.5
+                auto* texelPos =
+                    b.Subtract(b.Multiply(coords, fdim), b.Splat(ty.vec2f(), b.Constant(0.5_f)));
+
+                if (operands.offset) {
+                    texelPos = b.Add(texelPos, b.Convert(ty.vec2f(), operands.offset));
+                    // We've baked the offset into the coordinates, so clear it from the image
+                    // operands.
+                    operands.offset = nullptr;
+                }
+
+                // Snap to texel as we will be doing the bilinear filtering manually.
+                auto* i_j = b.Call(ty.vec2f(), core::BuiltinFn::kFloor, texelPos);
+
+                // fraction = texelPos - i_j
+                fract_bilinear = b.Subtract(texelPos, i_j)->Result();
+
+                // gatherUV = (i_j + 0.5) / dim
+                auto* gatherUV = b.Divide(b.Add(i_j, b.Splat(ty.vec2f(), b.Constant(0.5_f))), fdim);
+
+                // Update coords for the gather call.
+                coords = gatherUV->Result();
+            });
+        }
+
+        if (array_idx) {
+            coords = AppendArrayIndex(coords, array_idx, builtin);
         }
 
         // Start building the argument list for the function.
@@ -646,7 +839,10 @@ struct State {
 
         // Call the function.
         // If this is a depth comparison, the result is always f32, otherwise vec4f.
-        auto* result_ty = depth ? static_cast<const core::type::Type*>(ty.f32()) : ty.vec4<f32>();
+        auto* result_ty = (depth && !polyfill_depth_cube_array && !polyfill_depth_2d)
+                              ? static_cast<const core::type::Type*>(ty.f32())
+                              : ty.vec4f();
+
         core::ir::Instruction* result =
             b.Call<spirv::ir::BuiltinCall>(result_ty, function, std::move(function_args));
         result->InsertBefore(builtin);
@@ -656,6 +852,53 @@ struct State {
         if (!depth && texture_ty->GetDepth() == type::Depth::kDepth) {
             result = b.Access(ty.f32(), result, 0_u);
             result->InsertBefore(builtin);
+        }
+
+        if (polyfill_depth_cube_array) {
+            b.InsertAfter(result, [&] {
+                // This is an imperfect polyfill for builtin intrinsic to do PCF style shadows.
+                // See: crbug.com/467015399
+                // To do a complete polyfill we would have to properly do bilinear interpolation
+                // of the TextureGatherCompare result which we do not do as there is no trivial
+                // way to do it for a cubemap.
+
+                // We do a textureGatherCompare and then dot with a vec4f(0.25) to get the
+                // average result. This will give PCF-like shadows but they will not be as
+                // smooth as the result from the original TextureSampleCompare. We also only
+                // sample mip0 which is identical to TextureSampleCompareLevel but not
+                // TextureSampleCompare.
+                result = b.Call<spirv::ir::BuiltinCall>(ty.f32(), spirv::BuiltinFn::kDot, result,
+                                                        b.Splat(ty.vec4f(), b.Constant(0.25_f)));
+            });
+        }
+
+        if (polyfill_depth_2d) {
+            b.InsertAfter(result, [&] {
+                // Bilinear interpolation for 2D sampleCompare (2D polyfill).
+                // result from OpImageDrefGather (textureGatherCompare) is vec4f:
+                // [0]: (i,   j+1)
+                // [1]: (i+1, j+1)
+                // [2]: (i+1, j)
+                // [3]: (i,   j)
+                auto* x = b.Access(ty.f32(), result, 0_u);
+                auto* y = b.Access(ty.f32(), result, 1_u);
+                auto* z = b.Access(ty.f32(), result, 2_u);
+                auto* w = b.Access(ty.f32(), result, 3_u);
+
+                auto* fx = b.Access(ty.f32(), fract_bilinear, 0_u);
+                auto* fy = b.Access(ty.f32(), fract_bilinear, 1_u);
+
+                // top = mix(result.w, result.z, fract_bilinear.x)
+                // where result.w == (i,   j)
+                //       result.z == (i+1, j)
+                // fract_bilinear.x)
+                auto* top = b.Call(ty.f32(), core::BuiltinFn::kMix, w, z, fx);
+                // bottom = mix(result.x, result.y, fract_bilinear.x) -> mix((i, j+1), (i+1,
+                // j+1), fract_bilinear.x)
+                auto* bottom = b.Call(ty.f32(), core::BuiltinFn::kMix, x, y, fx);
+                // Percentage-closer filtering = mix(top, bottom, fract_bilinear.y)
+                result = b.Call(ty.f32(), core::BuiltinFn::kMix, top, bottom, fy);
+            });
         }
 
         result->SetResult(builtin->DetachResult());
@@ -668,7 +911,7 @@ struct State {
         // Helper to get the next argument from the call, or nullptr if there are no more arguments.
         uint32_t arg_idx = 0;
         auto next_arg = [&]() {
-            return arg_idx < builtin->Args().Length() ? builtin->Args()[arg_idx++] : nullptr;
+            return arg_idx < builtin->Args().size() ? builtin->Args()[arg_idx++] : nullptr;
         };
 
         auto* component = next_arg();
@@ -685,7 +928,7 @@ struct State {
 
         // Use OpSampledImage to create an OpTypeSampledImage object.
         auto* sampled_image = b.CallExplicit<spirv::ir::BuiltinCall>(
-            ty.Get<type::SampledImage>(texture_ty), spirv::BuiltinFn::kSampledImage,
+            ty.Get<type::SampledImage>(texture_ty), spirv::BuiltinFn::kOpSampledImage,
             Vector{texture_ty}, Vector{texture, sampler});
         sampled_image->InsertBefore(builtin);
 
@@ -711,7 +954,7 @@ struct State {
                 operands.offset = next_arg();
                 break;
             default:
-                TINT_UNIMPLEMENTED() << "unhandled texture gather builtin";
+                TINT_IR_UNIMPLEMENTED(ir) << "unhandled texture gather builtin";
         }
 
         // Start building the argument list for the function.
@@ -742,7 +985,7 @@ struct State {
         // Helper to get the next argument from the call, or nullptr if there are no more arguments.
         uint32_t arg_idx = 0;
         auto next_arg = [&]() {
-            return arg_idx < builtin->Args().Length() ? builtin->Args()[arg_idx++] : nullptr;
+            return arg_idx < builtin->Args().size() ? builtin->Args()[arg_idx++] : nullptr;
         };
 
         auto* texture = next_arg();
@@ -801,7 +1044,7 @@ struct State {
         // Helper to get the next argument from the call, or nullptr if there are no more arguments.
         uint32_t arg_idx = 0;
         auto next_arg = [&]() {
-            return arg_idx < builtin->Args().Length() ? builtin->Args()[arg_idx++] : nullptr;
+            return arg_idx < builtin->Args().size() ? builtin->Args()[arg_idx++] : nullptr;
         };
 
         auto* texture = next_arg();
@@ -840,7 +1083,7 @@ struct State {
         // Helper to get the next argument from the call, or nullptr if there are no more arguments.
         uint32_t arg_idx = 0;
         auto next_arg = [&]() {
-            return arg_idx < builtin->Args().Length() ? builtin->Args()[arg_idx++] : nullptr;
+            return arg_idx < builtin->Args().size() ? builtin->Args()[arg_idx++] : nullptr;
         };
 
         auto* texture = next_arg();
@@ -873,8 +1116,8 @@ struct State {
         }
 
         // Call the function.
-        core::ir::Instruction* result =
-            b.Call<spirv::ir::BuiltinCall>(result_ty, function, std::move(function_args));
+        core::ir::Instruction* result = b.CallExplicit<spirv::ir::BuiltinCall>(
+            result_ty, function, Vector{ty.u32()}, std::move(function_args));
         result->InsertBefore(builtin);
 
         // Swizzle the first two components from the result for arrayed textures.
@@ -937,8 +1180,8 @@ struct State {
         }
 
         // Call the function.
-        auto* texture_call =
-            b.Call<spirv::ir::BuiltinCall>(ty.vec3<u32>(), function, std::move(function_args));
+        auto* texture_call = b.CallExplicit<spirv::ir::BuiltinCall>(
+            ty.vec3u(), function, Vector{ty.u32()}, std::move(function_args));
         texture_call->InsertBefore(builtin);
 
         // Extract the third component to get the number of array layers.
@@ -953,7 +1196,7 @@ struct State {
     void QuantizeToF16Vec(core::ir::CoreBuiltinCall* builtin) {
         auto* arg = builtin->Args()[0];
         auto* vec = arg->Type()->As<core::type::Vector>();
-        TINT_ASSERT(vec);
+        TINT_IR_ASSERT(ir, vec);
 
         // Replace the builtin call with a call to the spirv.dot intrinsic.
         Vector<core::ir::Value*, 4> args;
@@ -972,11 +1215,11 @@ struct State {
     /// Handle an inputAttachmentLoad() builtin.
     /// @param builtin the builtin call instruction
     void InputAttachmentLoad(core::ir::CoreBuiltinCall* builtin) {
-        TINT_ASSERT(builtin->Args().Length() == 1);
+        TINT_IR_ASSERT(ir, builtin->Args().size() == 1);
 
         auto* texture = builtin->Args()[0];
         // coords for input_attachment are always (0, 0)
-        auto* coords = b.Composite(ty.vec2<i32>(), 0_i, 0_i);
+        auto* coords = b.Composite(ty.vec2i(), 0_i, 0_i);
 
         // Start building the argument list for the builtin.
         // The first two operands are always the texture and then the coordinates.
@@ -987,7 +1230,7 @@ struct State {
         // Call the builtin.
         // The result is always a vec4 in SPIR-V.
         auto* result_ty = builtin->Result()->Type();
-        TINT_ASSERT(result_ty->Is<core::type::Vector>());
+        TINT_IR_ASSERT(ir, result_ty->Is<core::type::Vector>());
 
         core::ir::Instruction* result = b.Call<spirv::ir::BuiltinCall>(
             result_ty, spirv::BuiltinFn::kImageRead, std::move(builtin_args));
@@ -997,26 +1240,39 @@ struct State {
         builtin->Destroy();
     }
 
-    /// Handle a SubgroupShuffle() builtin.
+    /// Handles SubgroupShuffle(), SubgroupShuffleDown(), SubgroupShuffleUp(), SubgroupShuffleXor()
+    /// builtins.
     /// @param builtin the builtin call instruction
-    void SubgroupShuffle(core::ir::CoreBuiltinCall* builtin) {
-        TINT_ASSERT(builtin->Args().Length() == 2);
-        auto* id = builtin->Args()[1];
-
-        // Id must be an unsigned integer scalar, so bitcast if necessary.
-        if (id->Type()->IsSignedIntegerScalar()) {
-            auto* cast = b.Bitcast(ty.u32(), id);
+    void SubgroupShuffle(core::ir::CoreBuiltinCall* builtin, bool clamp_subgroup_shuffle) {
+        TINT_IR_ASSERT(ir, builtin->Args().size() == 2);
+        // The second argument is either 'id' , 'delta', or 'mask'.
+        // All must be bound by [0, 128)
+        auto* arg2 = builtin->Args()[1];
+        // arg2 must be an unsigned integer scalar, so bitcast if necessary.
+        if (arg2->Type()->IsSignedIntegerScalar()) {
+            auto* cast = b.Bitcast(ty.u32(), arg2);
             cast->InsertBefore(builtin);
             builtin->SetArg(1, cast->Result());
+        }
+
+        /// Polyfill a `subgroupShuffleX` builtin call with one that has clamped the arg2 param
+        if (clamp_subgroup_shuffle) {
+            auto* shuffle_id = builtin->Args()[1];
+            auto* mask_max_subgroup_size =
+                b.Constant(core::u32(tint::internal_limits::kMaxSubgroupSize - 1));
+            b.InsertBefore(builtin, [&] {
+                auto* clamp_via_masking_and = b.And(shuffle_id, mask_max_subgroup_size);
+                builtin->SetArg(1, clamp_via_masking_and->Result());
+            });
         }
     }
 
     /// Handle a SubgroupBroadcast() builtin.
     /// @param builtin the builtin call instruction
     void SubgroupBroadcast(core::ir::CoreBuiltinCall* builtin) {
-        TINT_ASSERT(builtin->Args().Length() == 2);
+        TINT_IR_ASSERT(ir, builtin->Args().size() == 2);
         auto* id = builtin->Args()[1];
-        TINT_ASSERT(id->Is<core::ir::Constant>());
+        TINT_IR_ASSERT(ir, id->Is<core::ir::Constant>());
 
         // For const signed int IDs, compile-time convert to u32 to maintain constness.
         if (id->Type()->IsSignedIntegerScalar()) {
@@ -1027,9 +1283,9 @@ struct State {
     /// Handle a QuadBroadcast() builtin.
     /// @param builtin the builtin call instruction
     void QuadBroadcast(core::ir::CoreBuiltinCall* builtin) {
-        TINT_ASSERT(builtin->Args().Length() == 2);
+        TINT_IR_ASSERT(ir, builtin->Args().size() == 2);
         auto* id = builtin->Args()[1];
-        TINT_ASSERT(id->Is<core::ir::Constant>());
+        TINT_IR_ASSERT(ir, id->Is<core::ir::Constant>());
 
         // For const signed int IDs, compile-time convert to u32 to maintain constness.
         if (id->Type()->IsSignedIntegerScalar()) {
@@ -1041,7 +1297,7 @@ struct State {
     /// @param builtin the builtin call instruction
     void SubgroupMatrixLoad(core::ir::CoreBuiltinCall* builtin) {
         b.InsertBefore(builtin, [&] {
-            auto* result_ty = builtin->Result()->Type();
+            auto* result_ty = builtin->Result()->Type()->As<core::type::SubgroupMatrix>();
             auto* p = builtin->Args()[0];
             auto* offset = builtin->Args()[1];
             auto* col_major = builtin->Args()[2]->As<core::ir::Constant>();
@@ -1050,18 +1306,36 @@ struct State {
             auto* ptr = p->Type()->As<core::type::Pointer>();
             auto* arr = ptr->StoreType()->As<core::type::Array>();
 
-            // Make a pointer to the first element of the array that we will load from.
-            auto* elem_ptr = ty.ptr(ptr->AddressSpace(), arr->ElemType(), ptr->Access());
-            auto* src = b.Access(elem_ptr, p, offset);
-
             auto* layout = b.Constant(u32(col_major->Value()->ValueAs<bool>()
                                               ? SpvCooperativeMatrixLayoutColumnMajorKHR
                                               : SpvCooperativeMatrixLayoutRowMajorKHR));
             auto* memory_operand = Literal(u32(SpvMemoryAccessNonPrivatePointerMask));
 
+            // In SPIR-V `stride` and `offset` are related to the type of the input pointer, while
+            // in WGSL they both mean the number of elements. When the subgroup matrix element type
+            // is `i8` or `u8`, and the input array type is `i32` or `u32`, we need to convert the
+            // `stride` and `offset` in WGSL into the ones in SPIR-V by dividing them with 4.
+            auto* applied_stride = stride;
+            auto* applied_offset = offset;
+            if (result_ty->Type()->Size() == 1u && arr->ElemType()->Size() == 4u) {
+                if (!config.cooperative_matrix_stride_is_matrix_elements) {
+                    auto* applied_stride_binary =
+                        b.Binary(core::BinaryOp::kDivide, stride->Type(), stride, u32(4));
+                    applied_stride = applied_stride_binary->Result();
+                }
+
+                auto* applied_offset_binary =
+                    b.Binary(core::BinaryOp::kDivide, offset->Type(), offset, u32(4));
+                applied_offset = applied_offset_binary->Result();
+            }
+
+            // Make a pointer to the first element of the array that we will load from.
+            auto* elem_ptr = ty.ptr(ptr->AddressSpace(), arr->ElemType(), ptr->Access());
+            auto* src = b.Access(elem_ptr, p, applied_offset);
+
             auto* call = b.CallWithResult<spirv::ir::BuiltinCall>(
                 builtin->DetachResult(), spirv::BuiltinFn::kCooperativeMatrixLoad, src, layout,
-                stride, memory_operand);
+                applied_stride, memory_operand);
             call->SetExplicitTemplateParams(Vector{result_ty});
         });
         builtin->Destroy();
@@ -1074,15 +1348,35 @@ struct State {
             auto* p = builtin->Args()[0];
             auto* offset = builtin->Args()[1];
             auto* value = builtin->Args()[2];
+            auto* value_type = value->Type()->As<core::type::SubgroupMatrix>();
+
             auto* col_major = builtin->Args()[3]->As<core::ir::Constant>();
             auto* stride = builtin->Args()[4];
 
             auto* ptr = p->Type()->As<core::type::Pointer>();
             auto* arr = ptr->StoreType()->As<core::type::Array>();
 
+            // In SPIR-V `stride` and `offset` are related to the type of the input pointer, while
+            // in WGSL they both mean the number of elements. When the subgroup matrix element type
+            // is `i8` or `u8`, and the input array type is `i32` or `u32`, we need to convert the
+            // `stride` and `offset` in WGSL into the ones in SPIR-V by dividing them with 4.
+            auto* applied_stride = stride;
+            auto* applied_offset = offset;
+            if (value_type->Type()->Size() == 1u && arr->ElemType()->Size() == 4u) {
+                if (!config.cooperative_matrix_stride_is_matrix_elements) {
+                    auto* applied_stride_binary =
+                        b.Binary(core::BinaryOp::kDivide, stride->Type(), stride, u32(4));
+                    applied_stride = applied_stride_binary->Result();
+                }
+
+                auto* applied_offset_binary =
+                    b.Binary(core::BinaryOp::kDivide, offset->Type(), offset, u32(4));
+                applied_offset = applied_offset_binary->Result();
+            }
+
             // Make a pointer to the first element of the array that we will write to.
             auto* elem_ptr = ty.ptr(ptr->AddressSpace(), arr->ElemType(), ptr->Access());
-            auto* dst = b.Access(elem_ptr, p, offset);
+            auto* dst = b.Access(elem_ptr, p, applied_offset);
 
             auto* layout = b.Constant(u32(col_major->Value()->ValueAs<bool>()
                                               ? SpvCooperativeMatrixLayoutColumnMajorKHR
@@ -1090,7 +1384,7 @@ struct State {
             auto* memory_operand = Literal(u32(SpvMemoryAccessNonPrivatePointerMask));
 
             b.Call<spirv::ir::BuiltinCall>(ty.void_(), spirv::BuiltinFn::kCooperativeMatrixStore,
-                                           dst, value, layout, stride, memory_operand);
+                                           dst, value, layout, applied_stride, memory_operand);
         });
         builtin->Destroy();
     }
@@ -1099,9 +1393,8 @@ struct State {
     /// @param input_ty the type of the input matrices
     /// @param result_ty the type of the result matrix
     /// @returns the literal operands
-    ir::LiteralOperand* SubgroupMatrixMultiplyOperands(
-        const core::type::SubgroupMatrix* input_ty,
-        const core::type::SubgroupMatrix* result_ty) {
+    core::ir::Value* SubgroupMatrixMultiplyOperands(const core::type::SubgroupMatrix* input_ty,
+                                                    const core::type::SubgroupMatrix* result_ty) {
         uint32_t operands = SpvCooperativeMatrixOperandsMaskNone;
         if (input_ty->Type()->IsSignedIntegerScalar()) {
             operands |= SpvCooperativeMatrixOperandsMatrixASignedComponentsKHRMask;
@@ -1149,17 +1442,47 @@ struct State {
         });
         builtin->Destroy();
     }
+
+    /// Replace a subgroupMatrixScalar builtin.
+    /// @param builtin the builtin call instruction
+    /// @param op the operation to perform
+    void SubgroupMatrixScalar(core::ir::CoreBuiltinCall* builtin, core::BinaryOp op) {
+        b.InsertBefore(builtin, [&] {
+            auto* mat = builtin->Args()[0];
+            auto* scalar = builtin->Args()[1];
+
+            auto* sm_ty = mat->Type()->As<core::type::SubgroupMatrix>();
+            if (sm_ty->Type()->Is<core::type::I8>()) {
+                scalar = b.CallExplicit<spirv::ir::BuiltinCall>(
+                              ty.i8(), spirv::BuiltinFn::kSConvert, Vector{ty.i8()},
+                              b.Clamp(scalar, -128_i, 127_i))
+                             ->Result();
+            } else if (sm_ty->Type()->Is<core::type::U8>()) {
+                scalar = b.CallExplicit<spirv::ir::BuiltinCall>(
+                              ty.u8(), spirv::BuiltinFn::kUConvert, Vector{ty.u8()},
+                              b.Clamp(scalar, 0_u, 255_u))
+                             ->Result();
+            }
+
+            auto* scalar_mat = b.Construct(sm_ty, scalar);
+            b.BinaryWithResult<spirv::ir::Binary>(builtin->DetachResult(), op, mat, scalar_mat);
+        });
+        builtin->Destroy();
+    }
 };
 
 }  // namespace
 
-Result<SuccessType> BuiltinPolyfill(core::ir::Module& ir, bool use_vulkan_memory_model) {
-    auto result = ValidateAndDumpIfNeeded(ir, "spirv.BuiltinPolyfill");
-    if (result != Success) {
-        return result.Failure();
-    }
+Result<SuccessType> BuiltinPolyfill(core::ir::Module& ir, PolyfillConfig config) {
+    AssertValid(ir,
+                core::ir::Capabilities{
+                    core::ir::Capability::kAllow8BitIntegers,
+                    core::ir::Capability::kAllowDuplicateBindings,
+                    core::ir::Capability::kAllowNonCoreTypes,
+                },
+                "before spirv.BuiltinPolyfill");
 
-    State{ir, use_vulkan_memory_model}.Process();
+    State{ir, config}.Process();
 
     return Success;
 }

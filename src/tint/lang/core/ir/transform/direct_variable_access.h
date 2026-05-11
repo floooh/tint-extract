@@ -29,7 +29,7 @@
 #define SRC_TINT_LANG_CORE_IR_TRANSFORM_DIRECT_VARIABLE_ACCESS_H_
 
 #include "src/tint/lang/core/ir/validator.h"
-#include "src/tint/utils/reflection.h"
+#include "src/tint/utils/reflection/reflection.h"
 #include "src/tint/utils/result.h"
 
 // Forward declarations.
@@ -41,7 +41,18 @@ namespace tint::core::ir::transform {
 
 /// The capabilities that the transform can support.
 const core::ir::Capabilities kDirectVariableAccessCapabilities{
-    core::ir::Capability::kAllowClipDistancesOnF32,
+    core::ir::Capability::kAllowClipDistancesOnF32ScalarAndVector,
+    core::ir::Capability::kAllowDuplicateBindings,
+    core::ir::Capability::kAllowNonCoreTypes,
+    core::ir::Capability::kAllow8BitIntegers,
+    core::ir::Capability::kAllow16BitIntegers,
+};
+
+/// The level of handle workspace change
+enum class HandleTransformLevel {
+    kNone,
+    kExternal,
+    kFull,
 };
 
 /// DirectVariableAccessOptions adjusts the behaviour of the transform.
@@ -50,16 +61,20 @@ struct DirectVariableAccessOptions {
     bool transform_private = false;
     /// If true, then 'function' sub-object pointer arguments will be transformed.
     bool transform_function = false;
-    /// If true, then 'handle' sub-object handle type arguments will be transformed.
-    bool transform_handle = false;
+    /// If `kExternal` the external textures are transformed, if `kFull` then all 'handle'
+    /// sub-object handle type arguments will be transformed.
+    HandleTransformLevel transform_handle = HandleTransformLevel::kNone;
 
     /// Reflection for this class
-    TINT_REFLECT(DirectVariableAccessOptions, transform_private, transform_function);
+    TINT_REFLECT(DirectVariableAccessOptions,
+                 transform_private,
+                 transform_function,
+                 transform_handle);
 };
 
 /// DirectVariableAccess is a transform that transforms parameters in the 'storage',
 /// 'uniform' and 'workgroup' address space so that they're accessed directly by the function,
-/// instead of being passed by pointer. It will potentiall also transform `private`, `handle` or
+/// instead of being passed by pointer. It will potentially also transform `private`, `handle` or
 /// `function` parameters depending on provided options.
 ///
 /// DirectVariableAccess works by creating specializations of functions that have matching
@@ -75,5 +90,9 @@ Result<SuccessType> DirectVariableAccess(Module& module,
                                          const DirectVariableAccessOptions& options);
 
 }  // namespace tint::core::ir::transform
+
+namespace tint {
+TINT_REFLECT_ENUM_RANGE(tint::core::ir::transform::HandleTransformLevel, kNone, kFull);
+}
 
 #endif  // SRC_TINT_LANG_CORE_IR_TRANSFORM_DIRECT_VARIABLE_ACCESS_H_

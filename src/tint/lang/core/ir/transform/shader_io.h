@@ -33,6 +33,7 @@
 
 #include "src/tint/lang/core/ir/builder.h"
 #include "src/tint/lang/core/type/manager.h"
+#include "src/tint/utils/result.h"
 
 namespace tint::core::ir::transform {
 
@@ -73,12 +74,13 @@ struct ShaderIOBackendState {
     bool HasOutputs() const { return !outputs.IsEmpty(); }
 
     /// Finalize the shader inputs and create any state needed for the new entry point function.
-    /// @returns the list of function parameters for the new entry point
-    virtual Vector<FunctionParam*, 4> FinalizeInputs() = 0;
+    /// @returns the list of function parameters for the new entry point on success, otherwise a
+    /// failure reason
+    virtual Result<Vector<FunctionParam*, 4>> FinalizeInputs() = 0;
 
     /// Finalize the shader outputs and create state needed for the new entry point function.
-    /// @returns the return type for the new entry point
-    virtual const type::Type* FinalizeOutputs() = 0;
+    /// @returns the return type for the new entry point on success, otherwise a failure reason
+    virtual Result<const type::Type*> FinalizeOutputs() = 0;
 
     /// Get the value of the input at index @p idx
     /// @param builder the IR builder for new instructions
@@ -92,6 +94,9 @@ struct ShaderIOBackendState {
     /// @param value the value to set
     virtual void SetOutput(Builder& builder, uint32_t idx, Value* value) = 0;
 
+    /// Sets the backend specific outputs
+    virtual void SetBackendOutputs(Builder&, Value*) {}
+
     /// Create the return value for the entry point, based on the output values that have been set.
     /// @param builder the IR builder for new instructions
     /// @returns the return value for the new entry point
@@ -99,6 +104,40 @@ struct ShaderIOBackendState {
 
     /// @returns true if a vertex point size builtin should be added
     virtual bool NeedsVertexPointSize() const { return false; }
+
+    /// @returns true if there is an input with builtin @p builtin
+    bool HasBuiltinInput(core::BuiltinValue builtin) const;
+
+    /// Get the index of the input with builtin attribute @p builtin or create one if needed.
+    /// The @p type and @p name parameters are used to create the builtin if it was not found.
+    uint32_t RequireBuiltinInput(core::BuiltinValue builtin,
+                                 const core::type::Type* type,
+                                 std::string_view name);
+
+    /// Creates the polyfilled workgroup_index builtin value.
+    /// Each backend is responsible for tracking the indices of workgroup_id and num_workgroups
+    /// builtin values (and ensuring they are available in the module).
+    /// @param builder The IR builder
+    /// @param workgroup_id_index The index for GetInputs of the workgroup_id builtin value
+    /// @param num_workgroups_index The index for GetInputs of the num_workgroups builtin value
+    core::ir::Value* PolyfillWorkgroupIndex(Builder& builder,
+                                            uint32_t workgroup_id_index,
+                                            uint32_t num_workgroups_index);
+
+    /// Creates the polyfilled global_invocation_index builtin value.
+    /// Each backend is responsible for tracking the indices of global_invocation_id and
+    /// num_workgroups builtin values (and ensuring they are available in the module).
+    /// @param builder The IR builder
+    /// @param global_invocation_id_index The index for GetInputs of the global_invocation_id
+    /// builtin value
+    /// @param num_workgroups_index The index for GetInputs of the num_workgroups builtin value
+    core::ir::Value* PolyfillGlobalInvocationIndex(Builder& builder,
+                                                   uint32_t global_invocation_id_index,
+                                                   uint32_t num_workgroups_index);
+
+    /// The workgroup size of the entry point.
+    /// Backends are responsible for caching this value.
+    std::optional<std::array<uint32_t, 3>> workgroup_size = std::nullopt;
 
   protected:
     /// The IR module.
@@ -118,6 +157,9 @@ struct ShaderIOBackendState {
 
     /// The list of shader outputs.
     Vector<core::type::Manager::StructMemberDesc, 4> outputs;
+
+    core::ir::Value* tint_workgroup_index = nullptr;
+    core::ir::Value* tint_global_invocation_index = nullptr;
 };
 
 /// The signature for a function that creates a backend state object.
@@ -125,7 +167,9 @@ using MakeBackendStateFunc = std::unique_ptr<ShaderIOBackendState>(Module&, Func
 
 /// @param module the module to transform
 /// @param make_backend_state a function that creates a backend state object
-void RunShaderIOBase(Module& module, std::function<MakeBackendStateFunc> make_backend_state);
+/// @returns Success if all sub-tasks succeed, otherwise propagates the failure reason
+Result<SuccessType> RunShaderIOBase(Module& module,
+                                    std::function<MakeBackendStateFunc> make_backend_state);
 
 }  // namespace tint::core::ir::transform
 

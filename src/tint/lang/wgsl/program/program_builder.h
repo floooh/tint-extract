@@ -33,11 +33,9 @@
 #include <utility>
 
 #include "src/tint/api/common/override_id.h"
-
 #include "src/tint/lang/core/constant/manager.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/core/fluent_types.h"
-#include "src/tint/lang/core/interpolation_sampling.h"
-#include "src/tint/lang/core/interpolation_type.h"
 #include "src/tint/lang/core/number.h"
 #include "src/tint/lang/core/type/array.h"
 #include "src/tint/lang/core/type/bool.h"
@@ -57,11 +55,10 @@
 #include "src/tint/lang/core/type/vector.h"
 #include "src/tint/lang/core/type/void.h"
 #include "src/tint/lang/wgsl/ast/builder.h"
-#include "src/tint/lang/wgsl/extension.h"
+#include "src/tint/lang/wgsl/enums.h"
 #include "src/tint/lang/wgsl/program/program.h"
 #include "src/tint/lang/wgsl/sem/array_count.h"
 #include "src/tint/lang/wgsl/sem/struct.h"
-#include "src/tint/utils/generation_id.h"
 #include "src/tint/utils/text/string.h"
 
 #ifdef CURRENTLY_IN_TINT_PUBLIC_HEADER
@@ -92,18 +89,6 @@ class ProgramBuilder : public ast::Builder {
     /// @param rhs the builder to move
     /// @return this builder
     ProgramBuilder& operator=(ProgramBuilder&& rhs);
-
-    /// Wrap returns a new ProgramBuilder wrapping the Program `program` without
-    /// making a deep clone of the Program contents.
-    /// ProgramBuilder returned by Wrap() is intended to temporarily extend an
-    /// existing immutable program.
-    /// As the returned ProgramBuilder wraps `program`, `program` must not be
-    /// destructed or assigned while using the returned ProgramBuilder.
-    /// TODO(crbug.com/tint/460) - Evaluate whether there are safer alternatives to this
-    /// function.
-    /// @param program the immutable Program to wrap
-    /// @return the ProgramBuilder that wraps `program`
-    static ProgramBuilder Wrap(const Program& program);
 
     /// @returns a reference to the program's types
     core::type::Manager& Types() {
@@ -155,10 +140,9 @@ class ProgramBuilder : public ast::Builder {
     /// @param args the arguments to pass to the constructor
     /// @returns the node pointer
     template <typename T, typename... ARGS>
-    tint::traits::EnableIf<tint::traits::IsTypeOrDerived<T, sem::Node> &&
-                               !tint::traits::IsTypeOrDerived<T, core::type::Node>,
-                           T>*
-    create(ARGS&&... args) {
+        requires(tint::traits::IsTypeOrDerived<T, sem::Node> &&
+                 !tint::traits::IsTypeOrDerived<T, core::type::Node>)
+    T* create(ARGS&&... args) {
         AssertNotMoved();
         return sem_nodes_.Create<T>(std::forward<ARGS>(args)...);
     }
@@ -170,7 +154,8 @@ class ProgramBuilder : public ast::Builder {
     /// @param args the arguments to pass to the constructor
     /// @returns the new, or existing node
     template <typename T, typename... ARGS>
-    tint::traits::EnableIfIsType<T, core::type::Node>* create(ARGS&&... args) {
+        requires(traits::IsTypeOrDerived<T, core::type::Node>)
+    T* create(ARGS&&... args) {
         AssertNotMoved();
         return constants.types.Get<T>(std::forward<ARGS>(args)...);
     }
@@ -211,12 +196,6 @@ class ProgramBuilder : public ast::Builder {
     SemNodeAllocator sem_nodes_;
     sem::Info sem_;
 };
-
-/// @param builder the ProgramBuilder
-/// @returns the GenerationID of the ProgramBuilder
-inline GenerationID GenerationIDOf(const ProgramBuilder* builder) {
-    return builder->ID();
-}
 
 }  // namespace tint
 

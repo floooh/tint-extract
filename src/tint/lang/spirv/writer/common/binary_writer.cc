@@ -25,6 +25,11 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#ifdef UNSAFE_BUFFERS_BUILD
+// TODO(crbug.com/439062058): Remove this and convert code to safer constructs.
+#pragma allow_unsafe_buffers
+#endif
+
 #include "src/tint/lang/spirv/writer/common/binary_writer.h"
 
 #include <cstring>
@@ -52,9 +57,9 @@ void BinaryWriter::WriteInstruction(const Instruction& inst) {
     ProcessInstruction(inst);
 }
 
-void BinaryWriter::WriteHeader(uint32_t bound, uint32_t version) {
+void BinaryWriter::WriteHeader(uint32_t bound, uint32_t version, uint32_t spirv_version) {
     out_.push_back(spv::MagicNumber);
-    out_.push_back(0x00010300);  // Version 1.3
+    out_.push_back(spirv_version);
     out_.push_back(kGeneratorId | version);
     out_.push_back(bound);
     out_.push_back(0);

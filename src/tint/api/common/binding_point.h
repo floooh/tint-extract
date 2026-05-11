@@ -33,16 +33,18 @@
 #include <functional>
 
 #include "src/tint/utils/math/hash.h"
-#include "src/tint/utils/reflection.h"
+#include "src/tint/utils/reflection/reflection.h"
 #include "src/tint/utils/rtti/traits.h"
 
 namespace tint {
 
 /// BindingPoint holds a group and binding index.
 struct BindingPoint {
-    /// The `@group` part of the binding point
+    /// The index for the bind group.
+    /// In WGSL, this is `@group`, but in backends it may have been remapped to something else.
     uint32_t group = 0;
-    /// The `@binding` part of the binding point
+    /// The index for the bind point within the bind group.
+    /// In WGSL, this is `@binding`, but in backends it may have been remapped to something else.
     uint32_t binding = 0;
 
     /// Reflect the fields of this class so that it can be used by tint::ForeachField()
@@ -81,7 +83,8 @@ struct BindingPoint {
 /// @param o the stream to write to
 /// @param bp the BindingPoint
 /// @return the stream so calls can be chained
-template <typename STREAM, typename = traits::EnableIfIsOStream<STREAM>>
+template <typename STREAM>
+    requires(traits::IsOStream<STREAM>)
 auto& operator<<(STREAM& o, const BindingPoint& bp) {
     return o << "[group: " << bp.group << ", binding: " << bp.binding << "]";
 }

@@ -31,7 +31,6 @@
 #include <string>
 
 #include "src/tint/lang/core/ir/terminator.h"
-#include "src/tint/utils/containers/const_propagating_ptr.h"
 #include "src/tint/utils/rtti/castable.h"
 
 // Forward declarations
@@ -59,6 +58,9 @@ class NextIteration final : public Castable<NextIteration, Terminator> {
 
     ~NextIteration() override;
 
+    /// @copydoc Instruction::Destroy()
+    void Destroy() override;
+
     /// @copydoc Instruction::Clone()
     NextIteration* Clone(CloneContext& ctx) override;
 
@@ -75,7 +77,7 @@ class NextIteration final : public Castable<NextIteration, Terminator> {
     std::string FriendlyName() const override { return "next_iteration"; }
 
   private:
-    ConstPropagatingPtr<ir::Loop> loop_;
+    ir::Loop* loop_ = nullptr;
 };
 
 }  // namespace tint::core::ir

@@ -32,7 +32,6 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-
 #include "src/tint/lang/core/ir/disassembler.h"
 #include "src/tint/lang/core/ir/validator.h"
 #include "src/tint/lang/spirv/reader/common/helper_test.h"
@@ -42,12 +41,12 @@ namespace tint::spirv::reader {
 
 // Helper macro to run the parser and compare the disassembled IR to a string.
 // Automatically prefixes the IR disassembly with a newline to improve formatting of tests.
-#define EXPECT_IR(asm, ir)                               \
-    do {                                                 \
-        auto result = Run(asm);                          \
-        ASSERT_EQ(result, Success) << result.Failure();  \
-        auto got = "\n" + result.Get();                  \
-        ASSERT_THAT(got, testing::HasSubstr(ir)) << got; \
+#define EXPECT_IR(asm, ir)                                                                  \
+    do {                                                                                    \
+        auto result = Run(asm);                                                             \
+        ASSERT_EQ(result, Success) << result.Failure();                                     \
+        auto got = "\n" + result.Get();                                                     \
+        ASSERT_THAT(got, testing::HasSubstr(ir)) << "GOT:\n" << got << "EXPECTED:\n" << ir; \
     } while (false)
 
 /// Base helper class for testing the SPIR-V parser implementation.
@@ -59,25 +58,23 @@ class SpirvReaderTestHelperBase : public BASE {
     /// @returns the disassembled Tint IR or an error
     Result<std::string> Run(std::string spirv_asm) {
         // Assemble the SPIR-V input.
-        auto binary = Assemble(spirv_asm);
-        if (binary != Success) {
-            return binary.Failure();
-        }
+        TINT_CHECK_RESULT_UNWRAP(binary, Assemble(spirv_asm));
 
         // Parse the SPIR-V to produce a core IR module.
-        auto parsed = ReadIR(binary.Get());
-        if (parsed != Success) {
-            return parsed.Failure();
-        }
+        Options options{
+            .enable_validation_asserts = true,
+        };
+        TINT_CHECK_RESULT_UNWRAP(parsed, ReadIR(binary, options));
 
         // Validate the IR module against the capabilities supported by the core dialect.
-        auto validated = core::ir::Validate(parsed.Get());
-        if (validated != Success) {
-            return validated.Failure();
-        }
+        TINT_CHECK_RESULT(core::ir::Validate(parsed,
+                                             core::ir::Capabilities{
+                                                 core::ir::Capability::kAllowMultipleEntryPoints,
+                                             },
+                                             "after lowering to core IR"));
 
         // Return the disassembled IR module.
-        return "\n" + core::ir::Disassembler(parsed.Get()).Plain();
+        return "\n" + core::ir::Disassembler(parsed).Plain();
     }
 };
 

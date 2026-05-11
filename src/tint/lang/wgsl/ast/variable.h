@@ -31,8 +31,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/tint/lang/core/access.h"
-#include "src/tint/lang/core/address_space.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/wgsl/ast/attribute.h"
 #include "src/tint/lang/wgsl/ast/binding_attribute.h"
 #include "src/tint/lang/wgsl/ast/expression.h"
@@ -44,7 +43,6 @@
 // Forward declarations
 namespace tint::ast {
 class Identifier;
-class LocationAttribute;
 }  // namespace tint::ast
 
 namespace tint::ast {
@@ -58,15 +56,13 @@ namespace tint::ast {
 class Variable : public Castable<Variable, Node> {
   public:
     /// Constructor
-    /// @param pid the identifier of the program that owns this node
     /// @param nid the unique node identifier
     /// @param src the variable source
     /// @param name The struct member name
     /// @param type the declared variable type
     /// @param initializer the initializer expression
     /// @param attributes the variable attributes
-    Variable(GenerationID pid,
-             NodeID nid,
+    Variable(NodeID nid,
              const Source& src,
              const Identifier* name,
              Type type,

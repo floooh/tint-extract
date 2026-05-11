@@ -28,9 +28,6 @@
 #ifndef SRC_TINT_LANG_WGSL_SEM_CALL_TARGET_H_
 #define SRC_TINT_LANG_WGSL_SEM_CALL_TARGET_H_
 
-#include <vector>
-
-#include "src/tint/lang/core/type/sampler.h"
 #include "src/tint/lang/wgsl/sem/node.h"
 #include "src/tint/lang/wgsl/sem/variable.h"
 #include "src/tint/utils/containers/vector.h"
@@ -66,14 +63,6 @@ struct CallTargetSignature {
     /// @returns the index of the parameter with the given usage, or -1 if no
     /// parameter with the given usage exists.
     int IndexOf(core::ParameterUsage usage) const;
-
-    /// @param usage  the parameter usage to find
-    /// @returns the parameter with the given usage, or nullptr if no parameter with the given
-    /// usage exists.
-    inline const sem::Parameter* Parameter(core::ParameterUsage usage) const {
-        auto idx = IndexOf(usage);
-        return (idx >= 0) ? parameters[static_cast<size_t>(idx)] : nullptr;
-    }
 
     /// The type of the call target return value
     const core::type::Type* return_type = nullptr;

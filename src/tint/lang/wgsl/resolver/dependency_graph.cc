@@ -28,12 +28,9 @@
 #include "src/tint/lang/wgsl/resolver/dependency_graph.h"
 
 #include <string>
-#include <utility>
 #include <variant>
-#include <vector>
 
-#include "src/tint/lang/core/builtin_type.h"
-#include "src/tint/lang/core/builtin_value.h"
+#include "src/tint/lang/core/enums.h"
 #include "src/tint/lang/wgsl/ast/alias.h"
 #include "src/tint/lang/wgsl/ast/assignment_statement.h"
 #include "src/tint/lang/wgsl/ast/blend_src_attribute.h"
@@ -53,7 +50,6 @@
 #include "src/tint/lang/wgsl/ast/if_statement.h"
 #include "src/tint/lang/wgsl/ast/increment_decrement_statement.h"
 #include "src/tint/lang/wgsl/ast/input_attachment_index_attribute.h"
-#include "src/tint/lang/wgsl/ast/internal_attribute.h"
 #include "src/tint/lang/wgsl/ast/interpolate_attribute.h"
 #include "src/tint/lang/wgsl/ast/invariant_attribute.h"
 #include "src/tint/lang/wgsl/ast/let.h"
@@ -62,13 +58,11 @@
 #include "src/tint/lang/wgsl/ast/must_use_attribute.h"
 #include "src/tint/lang/wgsl/ast/override.h"
 #include "src/tint/lang/wgsl/ast/return_statement.h"
-#include "src/tint/lang/wgsl/ast/row_major_attribute.h"
 #include "src/tint/lang/wgsl/ast/stage_attribute.h"
-#include "src/tint/lang/wgsl/ast/stride_attribute.h"
 #include "src/tint/lang/wgsl/ast/struct.h"
 #include "src/tint/lang/wgsl/ast/struct_member_align_attribute.h"
-#include "src/tint/lang/wgsl/ast/struct_member_offset_attribute.h"
 #include "src/tint/lang/wgsl/ast/struct_member_size_attribute.h"
+#include "src/tint/lang/wgsl/ast/subgroup_size_attribute.h"
 #include "src/tint/lang/wgsl/ast/switch_statement.h"
 #include "src/tint/lang/wgsl/ast/templated_identifier.h"
 #include "src/tint/lang/wgsl/ast/traverse_expressions.h"
@@ -76,8 +70,6 @@
 #include "src/tint/lang/wgsl/ast/variable_decl_statement.h"
 #include "src/tint/lang/wgsl/ast/while_statement.h"
 #include "src/tint/lang/wgsl/ast/workgroup_attribute.h"
-#include "src/tint/lang/wgsl/sem/builtin_fn.h"
-#include "src/tint/utils/containers/map.h"
 #include "src/tint/utils/containers/scope_stack.h"
 #include "src/tint/utils/containers/unique_vector.h"
 #include "src/tint/utils/macros/compiler.h"
@@ -86,21 +78,12 @@
 #include "src/tint/utils/memory/block_allocator.h"
 #include "src/tint/utils/rtti/switch.h"
 #include "src/tint/utils/text/string.h"
-#include "src/tint/utils/text/string_stream.h"
-
-#define TINT_DUMP_DEPENDENCY_GRAPH 0
 
 namespace tint::resolver {
 namespace {
 
 // Forward declaration
 struct Global;
-
-/// Dependency describes how one global depends on another global
-struct DependencyInfo {
-    /// The source of the symbol that forms the dependency
-    Source source;
-};
 
 /// DependencyEdge describes the two Globals used to define a dependency
 /// relationship.
@@ -117,8 +100,8 @@ struct DependencyEdge {
     bool operator==(const DependencyEdge& rhs) const { return from == rhs.from && to == rhs.to; }
 };
 
-/// A map of DependencyEdge to DependencyInfo
-using DependencyEdges = Hashmap<DependencyEdge, DependencyInfo, 64>;
+/// A map of DependencyEdge to Source
+using DependencyEdges = Hashmap<DependencyEdge, Source, 64>;
 
 /// Global describes a module-scope variable, type or function.
 struct Global {
@@ -238,9 +221,6 @@ class DependencyScanner {
         TINT_DEFER(scope_stack_.Pop());
 
         for (auto* param : func->params) {
-            if (auto shadows = scope_stack_.Get(param->name->symbol)) {
-                graph_.shadows.Add(param, shadows);
-            }
             Declare(param->name->symbol, param);
         }
         if (func->body) {
@@ -312,9 +292,6 @@ class DependencyScanner {
                 }
             },
             [&](const ast::VariableDeclStatement* v) {
-                if (auto* shadows = scope_stack_.Get(v->variable->name->symbol)) {
-                    graph_.shadows.Add(v->variable, shadows);
-                }
                 TraverseVariable(v->variable);
                 Declare(v->variable->name->symbol, v->variable);
             },
@@ -390,24 +367,18 @@ class DependencyScanner {
                 TraverseExpression(wg->y);
                 TraverseExpression(wg->z);
             },
-            [&](const ast::InternalAttribute* i) {
-                for (auto* dep : i->dependencies) {
-                    TraverseExpression(dep);
-                }
-            },
+            [&](const ast::SubgroupSizeAttribute* sg) { TraverseExpression(sg->subgroup_size); },
             [&](Default) {
                 if (!attr->IsAnyOf<ast::BuiltinAttribute, ast::DiagnosticAttribute,
                                    ast::InterpolateAttribute, ast::InvariantAttribute,
-                                   ast::MustUseAttribute, ast::RowMajorAttribute,
-                                   ast::StageAttribute, ast::StrideAttribute,
-                                   ast::StructMemberOffsetAttribute>()) {
+                                   ast::MustUseAttribute, ast::StageAttribute>()) {
                     TINT_ICE() << "unhandled attribute type: " << attr->TypeInfo().name;
                 }
             });
     }
 
     /// The type of builtin that a symbol could represent.
-    enum class BuiltinType {
+    enum class Kind : uint8_t {
         /// No builtin matched
         kNone = 0,
         /// Builtin function
@@ -420,6 +391,10 @@ class DependencyScanner {
         kTexelFormat,
         /// Access
         kAccess,
+        /// Texture filterable
+        kTextureFilterable,
+        /// Sampler filtering
+        kSamplerFiltering,
     };
 
     /// BuiltinInfo stores information about the builtin that a symbol represents.
@@ -430,14 +405,16 @@ class DependencyScanner {
             return std::get<T>(value);
         }
 
-        BuiltinType type = BuiltinType::kNone;
+        Kind type = Kind::kNone;
         std::variant<std::monostate,
                      wgsl::BuiltinFn,
                      core::BuiltinType,
                      core::AddressSpace,
                      core::TexelFormat,
-                     core::Access>
-            value = {};
+                     core::Access,
+                     core::TextureFilterable,
+                     core::SamplerFiltering>
+            value{};
     };
 
     /// Get the builtin info for a given symbol.
@@ -447,23 +424,31 @@ class DependencyScanner {
         return builtin_info_map.GetOrAdd(symbol, [&] {
             if (auto builtin_fn = wgsl::ParseBuiltinFn(symbol.NameView());
                 builtin_fn != wgsl::BuiltinFn::kNone) {
-                return BuiltinInfo{BuiltinType::kFunction, builtin_fn};
+                return BuiltinInfo{Kind::kFunction, builtin_fn};
             }
             if (auto builtin_ty = core::ParseBuiltinType(symbol.NameView());
                 builtin_ty != core::BuiltinType::kUndefined) {
-                return BuiltinInfo{BuiltinType::kBuiltin, builtin_ty};
+                return BuiltinInfo{Kind::kBuiltin, builtin_ty};
             }
             if (auto addr = core::ParseAddressSpace(symbol.NameView());
                 addr != core::AddressSpace::kUndefined) {
-                return BuiltinInfo{BuiltinType::kAddressSpace, addr};
+                return BuiltinInfo{Kind::kAddressSpace, addr};
             }
             if (auto fmt = core::ParseTexelFormat(symbol.NameView());
                 fmt != core::TexelFormat::kUndefined) {
-                return BuiltinInfo{BuiltinType::kTexelFormat, fmt};
+                return BuiltinInfo{Kind::kTexelFormat, fmt};
             }
             if (auto access = core::ParseAccess(symbol.NameView());
                 access != core::Access::kUndefined) {
-                return BuiltinInfo{BuiltinType::kAccess, access};
+                return BuiltinInfo{Kind::kAccess, access};
+            }
+            if (auto filterable = core::ParseTextureFilterable(symbol.NameView());
+                filterable != core::TextureFilterable::kUndefined) {
+                return BuiltinInfo{Kind::kTextureFilterable, filterable};
+            }
+            if (auto filterable = core::ParseSamplerFiltering(symbol.NameView());
+                filterable != core::SamplerFiltering::kUndefined) {
+                return BuiltinInfo{Kind::kSamplerFiltering, filterable};
             }
             return BuiltinInfo{};
         });
@@ -475,37 +460,44 @@ class DependencyScanner {
         if (!resolved) {
             auto builtin_info = GetBuiltinInfo(to);
             switch (builtin_info.type) {
-                case BuiltinType::kNone:
+                case Kind::kNone:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier::UnresolvedIdentifier{to.Name()});
                     break;
-                case BuiltinType::kFunction:
+                case Kind::kFunction:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier(builtin_info.Value<wgsl::BuiltinFn>()));
                     break;
-                case BuiltinType::kBuiltin:
+                case Kind::kBuiltin:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier(builtin_info.Value<core::BuiltinType>()));
                     break;
-                case BuiltinType::kAddressSpace:
+                case Kind::kAddressSpace:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier(builtin_info.Value<core::AddressSpace>()));
                     break;
-                case BuiltinType::kTexelFormat:
+                case Kind::kTexelFormat:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier(builtin_info.Value<core::TexelFormat>()));
                     break;
-                case BuiltinType::kAccess:
+                case Kind::kAccess:
                     graph_.resolved_identifiers.Add(
                         from, ResolvedIdentifier(builtin_info.Value<core::Access>()));
+                    break;
+                case Kind::kTextureFilterable:
+                    graph_.resolved_identifiers.Add(
+                        from, ResolvedIdentifier(builtin_info.Value<core::TextureFilterable>()));
+                    break;
+                case Kind::kSamplerFiltering:
+                    graph_.resolved_identifiers.Add(
+                        from, ResolvedIdentifier(builtin_info.Value<core::SamplerFiltering>()));
                     break;
             }
             return;
         }
 
         if (auto global = globals_.Get(to); global && (*global)->node == resolved) {
-            if (dependency_edges_.Add(DependencyEdge{current_global_, *global},
-                                      DependencyInfo{from->source})) {
+            if (dependency_edges_.Add(DependencyEdge{current_global_, *global}, from->source)) {
                 current_global_->deps.Push(*global);
             }
         }
@@ -513,7 +505,6 @@ class DependencyScanner {
         graph_.resolved_identifiers.Add(from, ResolvedIdentifier(resolved));
     }
 
-    using VariableMap = Hashmap<Symbol, const ast::Variable*, 32>;
     const GlobalMap& globals_;
     diag::List& diagnostics_;
     DependencyGraph& graph_;
@@ -548,9 +539,6 @@ struct DependencyAnalysis {
 
         // Sort the globals into dependency order
         SortGlobals();
-
-        // Dump the dependency graph if TINT_DUMP_DEPENDENCY_GRAPH is non-zero
-        DumpDependencyGraph();
 
         graph_.ordered_globals = sorted_.Release();
 
@@ -708,23 +696,10 @@ struct DependencyAnalysis {
 
             sorted_.Add(global->node);
 
-            if (DAWN_UNLIKELY(!stack.IsEmpty())) {
-                // Each stack.push() must have a corresponding stack.pop_back().
-                TINT_ICE() << "stack not empty after returning from TraverseDependencies()";
-            }
+            // Each stack.push() must have a corresponding stack.pop_back().
+            TINT_ASSERT(stack.IsEmpty())
+                << "stack not empty after returning from TraverseDependencies()";
         }
-    }
-
-    /// DepInfoFor() looks up the global dependency information for the dependency
-    /// of global `from` depending on `to`.
-    /// @note will raise an ICE if the edge is not found.
-    DependencyInfo DepInfoFor(const Global* from, const Global* to) const {
-        auto info = dependency_edges_.Get(DependencyEdge{from, to});
-        if (DAWN_LIKELY(info)) {
-            return *info;
-        }
-        TINT_ICE() << "failed to find dependency info for edge: '" << NameOf(from->node) << "' -> '"
-                   << NameOf(to->node) << "'";
     }
 
     /// CyclicDependencyFound() emits an error diagnostic for a cyclic dependency.
@@ -750,34 +725,17 @@ struct DependencyAnalysis {
         for (size_t i = loop_start; i < stack.Length(); i++) {
             auto* from = stack[i];
             auto* to = (i + 1 < stack.Length()) ? stack[i + 1] : stack[loop_start];
-            auto info = DepInfoFor(from, to);
-            AddNote(diagnostics_, info.source)
+
+            auto source = dependency_edges_.Get(DependencyEdge{from, to});
+            if (DAWN_UNLIKELY(!source)) {
+                TINT_ICE() << "failed to find dependency info for edge: '" << NameOf(from->node)
+                           << "' -> '" << NameOf(to->node) << "'";
+            }
+
+            AddNote(diagnostics_, *source)
                 << KindOf(from->node) + " '" << NameOf(from->node) << "' references "
                 << KindOf(to->node) << " '" << NameOf(to->node) << "' here";
         }
-    }
-
-    void DumpDependencyGraph() {
-#if TINT_DUMP_DEPENDENCY_GRAPH == 0
-        if ((true)) {
-            return;
-        }
-#endif  // TINT_DUMP_DEPENDENCY_GRAPH
-        printf("=========================\n");
-        printf("------ declaration ------ \n");
-        for (auto* global : declaration_order_) {
-            printf("%s\n", NameOf(global->node).c_str());
-        }
-        printf("------ dependencies ------ \n");
-        for (auto* node : sorted_) {
-            auto symbol = SymbolOf(node);
-            auto* global = *globals_.Get(symbol);
-            printf("%s depends on:\n", symbol.Name().c_str());
-            for (auto* dep : global->deps) {
-                printf("  %s\n", NameOf(dep->node).c_str());
-            }
-        }
-        printf("=========================\n");
     }
 
     /// Program diagnostics
@@ -792,7 +750,7 @@ struct DependencyAnalysis {
     /// Global map, keyed by name. Populated by GatherGlobals().
     GlobalMap globals_;
 
-    /// Map of DependencyEdge to DependencyInfo. Populated by DetermineDependencies().
+    /// Map of DependencyEdge to Source. Populated by DetermineDependencies().
     DependencyEdges dependency_edges_;
 
     /// Globals in declaration order. Populated by GatherGlobals().

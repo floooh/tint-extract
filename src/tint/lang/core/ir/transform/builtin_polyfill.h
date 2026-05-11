@@ -28,7 +28,8 @@
 #ifndef SRC_TINT_LANG_CORE_IR_TRANSFORM_BUILTIN_POLYFILL_H_
 #define SRC_TINT_LANG_CORE_IR_TRANSFORM_BUILTIN_POLYFILL_H_
 
-#include "src/tint/utils/reflection.h"
+#include "src/tint/lang/core/ir/validator.h"
+#include "src/tint/utils/reflection/reflection.h"
 #include "src/tint/utils/result.h"
 
 // Forward declarations.
@@ -37,6 +38,14 @@ class Module;
 }
 
 namespace tint::core::ir::transform {
+
+/// The capabilities that the transform can support.
+const Capabilities kBuiltinPolyfillCapabilities{
+    Capability::kAllowDuplicateBindings,
+    Capability::kAllowNonCoreTypes,
+    Capability::kAllow8BitIntegers,
+    Capability::kAllow16BitIntegers,
+};
 
 /// Enumerator of polyfill levels.
 enum class BuiltinPolyfillLevel {
@@ -52,12 +61,18 @@ enum class BuiltinPolyfillLevel {
 struct BuiltinPolyfillConfig {
     /// Should `clamp()` be polyfilled for integer values?
     bool clamp_int = false;
+    /// Should `clamp()` be polyfilled for floating values?
+    bool clamp_float = false;
+    /// Should `abs()` be polyfilled for signed integer values?
+    bool abs_signed_int = false;
     /// Should `countLeadingZeros()` be polyfilled?
     bool count_leading_zeros = false;
     /// Should `countTrailingZeros()` be polyfilled?
     bool count_trailing_zeros = false;
     /// Should `degrees()` be polyfilled?
     bool degrees = false;
+    /// Should `distance()` be polyfilled for scalar f32 and f16?
+    bool distance_scalar_float = false;
     /// How should `extractBits()` be polyfilled?
     BuiltinPolyfillLevel extract_bits = BuiltinPolyfillLevel::kNone;
     /// Should `firstLeadingBit()` be polyfilled?
@@ -68,6 +83,8 @@ struct BuiltinPolyfillConfig {
     bool fwidth_fine = false;
     /// How should `insertBits()` be polyfilled?
     BuiltinPolyfillLevel insert_bits = BuiltinPolyfillLevel::kNone;
+    /// Should `length()` be polyfilled for scalar f32 and f16?
+    bool length_scalar_float = false;
     /// Should `radians()` be polyfilled?
     bool radians = false;
     /// Should `reflect()` be polyfilled for vec2<f32>?
@@ -86,21 +103,36 @@ struct BuiltinPolyfillConfig {
     bool pack_4xu8_clamp = false;
     /// Should `pack4x8snorm`, `pack4x8unorm`, `unpack4x8snorm` and `unpack4x8unorm` be polyfilled?
     bool pack_unpack_4x8_norm = false;
+    /// Should `subgroupBroadcast(f16)` be polyfilled?
+    bool subgroup_broadcast_f16 = false;
+    /// Should 'saturate(f16)' be polyfilled with min and max.
+    bool saturate_as_min_max = false;
 
     /// Reflection for this class
     TINT_REFLECT(BuiltinPolyfillConfig,
                  clamp_int,
+                 clamp_float,
+                 abs_signed_int,
                  count_leading_zeros,
                  count_trailing_zeros,
+                 degrees,
+                 distance_scalar_float,
                  extract_bits,
                  first_leading_bit,
                  first_trailing_bit,
+                 fwidth_fine,
                  insert_bits,
+                 length_scalar_float,
+                 radians,
+                 reflect_vec2_f32,
                  saturate,
                  texture_sample_base_clamp_to_edge_2d_f32,
                  dot_4x8_packed,
                  pack_unpack_4x8,
-                 pack_4xu8_clamp);
+                 pack_4xu8_clamp,
+                 pack_unpack_4x8_norm,
+                 subgroup_broadcast_f16,
+                 saturate_as_min_max);
 };
 
 /// BuiltinPolyfill is a transform that replaces calls to builtin functions and uses of other core
