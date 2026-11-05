@@ -30,6 +30,7 @@
 
 #include <memory>
 #include <variant>
+#include <stdint.h>
 
 namespace tint::core::ir {
 class Binary;
